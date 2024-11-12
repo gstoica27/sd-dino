@@ -19,7 +19,12 @@ from utils.logger import get_logger
 from loguru import logger
 import argparse
 from extractor_dino import ViTExtractor
+from extractor_hf_dino import ViTExtractor as ViTExtractorHF
+from extractor_hf_openclip import ViTExtractor as OpenClipExtractorHF
+
 from extractor_sd import load_model, process_features_and_mask, get_mask
+from copy import deepcopy
+
 
 def preprocess_kps_pad(kps, img_width, img_height, size):
     # Once an image has been pre-processed via border (or zero) padding,
@@ -157,27 +162,44 @@ def load_pascal_data(path, size=256, category='cat', split='test', subsample=Non
     logger.info(f'Final number of used key points: {kps.size(1)}')
     return files, kps, None
 
-def compute_pck(model, aug, save_path, files, kps, category, mask=False, dist='cos', thresholds=None, real_size=960):
+def compute_pck(
+    model, aug, save_path, files, kps, category, 
+    mask=False, dist='cos', thresholds=None, 
+    real_size=960, layer=9, facet='key'
+):
     
-    img_size = 840 if DINOV2 else 224 if ONLY_DINO else 480
-    model_dict={'small':'dinov2_vits14',
-                'base':'dinov2_vitb14',
-                'large':'dinov2_vitl14',
-                'giant':'dinov2_vitg14'}
+    img_size = 224
+    model_dict={
+        'small':'dinov2_vits14',
+        'base':'dinov2_vitb14',
+        'large':'dinov2_vitl14',
+        'giant':'dinov2_vitg14',
+        'hf_dinov1_vitb16': 'facebook/dino-vitb16',
+        'openclip_vitb16': ( 'ViT-B-16', 'laion400m_e31')
+    }
     
-    model_type = model_dict[MODEL_SIZE] if DINOV2 else 'dino_vits8'
-    layer = 11 if DINOV2 else 9
+    model_type = model_dict[MODEL_SIZE]# if DINOV2 else 'dino_vits8'
+    # layer = 11 if DINOV2 else 9
     if 'l' in model_type:
         layer = 23
     elif 'g' in model_type:
         layer = 39
-    facet = 'token' if DINOV2 else 'key'
-    stride = 14 if DINOV2 else 4 if ONLY_DINO else 8
+    # facet = 'token' if DINOV2 else 'key'
+    stride = 4
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # indiactor = 'v2' if DINOV2 else 'v1'
     # model_size = model_type.split('vit')[-1]
-    extractor = ViTExtractor(model_type, stride, device=device)
-    patch_size = extractor.model.patch_embed.patch_size[0] if DINOV2 else extractor.model.patch_embed.patch_size
+    if 'hf_dinov1_vitb16' == MODEL_SIZE:
+        logger.info("Using HF DINOv1 model")
+        extractor = ViTExtractorHF(model_type, stride, device=device)
+        patch_size = extractor.model.embeddings.patch_size
+    elif 'openclip_vitb16' == MODEL_SIZE:
+        logger.info("Using OpenClip model")
+        extractor = OpenClipExtractorHF(model_type, stride, device=device)
+        patch_size = extractor.model.patch_size[0]
+    else:
+        extractor = ViTExtractor(model_type, stride, device=device)
+        patch_size = extractor.model.embeddings.patch_size
     num_patches = int(patch_size / stride * (img_size // patch_size - 1) + 1)
     
     input_text = "a photo of "+category if TEXT_INPUT else None
@@ -220,47 +242,18 @@ def compute_pck(model, aug, save_path, files, kps, category, mask=False, dist='c
         # pdb.set_trace()
         with torch.no_grad():
             if not CO_PCA:
-                if not ONLY_DINO:
-                    img1_desc = process_features_and_mask(model, aug, img1_input, input_text=input_text, mask=False).reshape(1,1,-1, num_patches**2).permute(0,1,3,2)
-                    img2_desc = process_features_and_mask(model, aug, img2_input, category, input_text=input_text,  mask=mask).reshape(1,1,-1, num_patches**2).permute(0,1,3,2)
-                if FUSE_DINO:
-                    img1_batch = extractor.preprocess_pil(img1)
-                    img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
-                    img2_batch = extractor.preprocess_pil(img2)
-                    img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
+                # if FUSE_DINO:
+                img1_batch = extractor.preprocess_pil(img1)
+                img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
+                img2_batch = extractor.preprocess_pil(img2)
+                img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
 
             else:
-                if not ONLY_DINO:
-                    features1 = process_features_and_mask(model, aug, img1_input, input_text=input_text,  mask=False, raw=True)
-                    features2 = process_features_and_mask(model, aug, img2_input, input_text=input_text,  mask=False, raw=True)
-                    if not RAW:
-                        processed_features1, processed_features2 = co_pca(features1, features2, PCA_DIMS)
-                    else:
-                        if WEIGHT[0]:
-                            processed_features1 = features1['s5']
-                            processed_features2 = features2['s5']
-                        elif WEIGHT[1]:
-                            processed_features1 = features1['s4']
-                            processed_features2 = features2['s4']
-                        elif WEIGHT[2]:
-                            processed_features1 = features1['s3']
-                            processed_features2 = features2['s3']
-                        elif WEIGHT[3]:
-                            processed_features1 = features1['s2']
-                            processed_features2 = features2['s2']
-                        else:
-                            raise NotImplementedError
-                        # rescale the features
-                        processed_features1 = F.interpolate(processed_features1, size=(num_patches, num_patches), mode='bilinear', align_corners=False)
-                        processed_features2 = F.interpolate(processed_features2, size=(num_patches, num_patches), mode='bilinear', align_corners=False)
-
-                    img1_desc = processed_features1.reshape(1, 1, -1, num_patches**2).permute(0,1,3,2)
-                    img2_desc = processed_features2.reshape(1, 1, -1, num_patches**2).permute(0,1,3,2)
-                if FUSE_DINO:
-                    img1_batch = extractor.preprocess_pil(img1)
-                    img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
-                    img2_batch = extractor.preprocess_pil(img2)
-                    img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
+                # if FUSE_DINO:
+                img1_batch = extractor.preprocess_pil(img1)
+                img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
+                img2_batch = extractor.preprocess_pil(img2)
+                img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
             
             if CO_PCA_DINO:
                 cat_desc_dino = torch.cat((img1_desc_dino, img2_desc_dino), dim=2).squeeze() # (1, 1, num_patches**2, dim)
@@ -272,16 +265,6 @@ def compute_pck(model, aug, save_path, files, kps, category, mask=False, dist='c
                 img1_desc_dino = processed_co_features[:, :, :img1_desc_dino.shape[2], :]
                 img2_desc_dino = processed_co_features[:, :, img1_desc_dino.shape[2]:, :]
 
-            if not ONLY_DINO and not RAW: # reweight different layers of sd
-
-                img1_desc[...,:PCA_DIMS[0]]*=WEIGHT[0]
-                img1_desc[...,PCA_DIMS[0]:PCA_DIMS[1]+PCA_DIMS[0]]*=WEIGHT[1]
-                img1_desc[...,PCA_DIMS[1]+PCA_DIMS[0]:PCA_DIMS[2]+PCA_DIMS[1]+PCA_DIMS[0]]*=WEIGHT[2]
-
-                img2_desc[...,:PCA_DIMS[0]]*=WEIGHT[0]
-                img2_desc[...,PCA_DIMS[0]:PCA_DIMS[1]+PCA_DIMS[0]]*=WEIGHT[1]
-                img2_desc[...,PCA_DIMS[1]+PCA_DIMS[0]:PCA_DIMS[2]+PCA_DIMS[1]+PCA_DIMS[0]]*=WEIGHT[2]
-
             if 'l1' in dist or 'l2' in dist or dist == 'plus_norm':
                 # normalize the features
                 img1_desc = img1_desc / img1_desc.norm(dim=-1, keepdim=True)
@@ -289,32 +272,20 @@ def compute_pck(model, aug, save_path, files, kps, category, mask=False, dist='c
                 img1_desc_dino = img1_desc_dino / img1_desc_dino.norm(dim=-1, keepdim=True)
                 img2_desc_dino = img2_desc_dino / img2_desc_dino.norm(dim=-1, keepdim=True)
 
-            if FUSE_DINO and not ONLY_DINO and dist!='plus' and dist!='plus_norm':
-                # cat two features together
-                img1_desc = torch.cat((img1_desc, img1_desc_dino), dim=-1)
-                img2_desc = torch.cat((img2_desc, img2_desc_dino), dim=-1)
-                if not RAW:
-                    # reweight sd and dino
-                    img1_desc[...,:PCA_DIMS[2]+PCA_DIMS[1]+PCA_DIMS[0]]*=WEIGHT[3]
-                    img1_desc[...,PCA_DIMS[2]+PCA_DIMS[1]+PCA_DIMS[0]:]*=WEIGHT[4]
-                    img2_desc[...,:PCA_DIMS[2]+PCA_DIMS[1]+PCA_DIMS[0]]*=WEIGHT[3]
-                    img2_desc[...,PCA_DIMS[2]+PCA_DIMS[1]+PCA_DIMS[0]:]*=WEIGHT[4]
-
-            elif dist=='plus' or dist=='plus_norm':
+            if dist=='plus' or dist=='plus_norm':
                 img1_desc = img1_desc + img1_desc_dino
                 img2_desc = img2_desc + img2_desc_dino
                 dist='cos'
             
-            if ONLY_DINO:
-                img1_desc = img1_desc_dino
-                img2_desc = img2_desc_dino
-            # logger.info(img1_desc.shape, img2_desc.shape)
+            img1_desc = img1_desc_dino
+            img2_desc = img2_desc_dino
+        # logger.info(img1_desc.shape, img2_desc.shape)
 
             if DRAW_DENSE:
                 mask1 = get_mask(model, aug, img1, category)
                 mask2 = get_mask(model, aug, img2, category)
 
-                if ONLY_DINO or not FUSE_DINO:
+                if ONLY_DINO:# or not FUSE_DINO:
                     img1_desc = img1_desc / img1_desc.norm(dim=-1, keepdim=True)
                     img2_desc = img2_desc / img2_desc.norm(dim=-1, keepdim=True)
                 
@@ -337,7 +308,7 @@ def compute_pck(model, aug, save_path, files, kps, category, mask=False, dist='c
                     mask1 = get_mask(model, aug, img1, category)
                     mask2 = get_mask(model, aug, img2, category)
 
-                if ONLY_DINO or not FUSE_DINO:
+                if ONLY_DINO:# or not FUSE_DINO:
                     img1_desc = img1_desc / img1_desc.norm(dim=-1, keepdim=True)
                     img2_desc = img2_desc / img2_desc.norm(dim=-1, keepdim=True)
                     
@@ -369,6 +340,7 @@ def compute_pck(model, aug, save_path, files, kps, category, mask=False, dist='c
         if COUNT_INVIS:
             vis = torch.ones_like(vis)
         # Get similarity matrix
+        # pdb.set_trace()
         if dist == 'cos':
             sim_1_to_2 = chunk_cosine_sim(img1_desc, img2_desc).squeeze()
         elif dist == 'l2':
@@ -453,7 +425,7 @@ def main(args):
     INDICES = args.INDICES
     EDGE_PAD = args.EDGE_PAD
 
-    FUSE_DINO = False if args.NOT_FUSE else True
+    FUSE_DINO = True
     ONLY_DINO = args.ONLY_DINO
     DINOV2 = False if args.DINOV1 else True
     MODEL_SIZE = args.MODEL_SIZE
@@ -467,7 +439,11 @@ def main(args):
     WEIGHT = args.WEIGHT # corresponde to three groups for the sd features, and one group for the dino features
     PASCAL = args.PASCAL
     RAW = args.RAW
-
+    
+    LAYERS = [2, 5, 8, 9, 10, 11]
+    # LAYERS = [9, 10, 11]
+    FACETS = ['key', 'query', 'value', 'token'][::-1]
+    
     if SAMPLE == 0:
         SAMPLE = None
     if DRAW_DENSE or DRAW_SWAP:
@@ -513,33 +489,81 @@ def main(args):
                     'bus', 'car', 'cat', 'chair', 'cow',
                     'diningtable', 'dog', 'horse', 'motorbike', 'person',
                     'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'] # for pascal
-    img_size = 840 if DINOV2 else 224 if ONLY_DINO else 480
-
-    pcks = []
-    pcks_05 = []
-    pcks_01 = []
+    # img_size = 840 if DINOV2 else 224 if ONLY_DINO else 480
+    img_size = 224
+    best_pcks = None
     start_time=time.time()
-    for cat in categories:
-        # pdb.set_trace()
-        # files, kps, thresholds = load_spair_data(data_dir, size=img_size, category=cat, subsample=SAMPLE) if not PASCAL else load_pascal_data(data_dir, size=img_size, category=cat, subsample=SAMPLE)
-        if PASCAL:
-            files, kps, thresholds = load_pascal_data(data_dir, size=img_size, category=cat, subsample=SAMPLE)
-        else:
-            files, kps, thresholds = load_spair_data(data_dir, size=img_size, category=cat, subsample=SAMPLE)
+    for layer in LAYERS:
+        for facet in FACETS:
+            logger.info("-"*50)
+            logger.info(f"Layer: {layer}, Facet: {facet}")
+            config_pcks = {
+                'categories': categories + ['average'],
+                'PCK0.10': [],
+                'PCK0.05': [],
+                'PCK0.01': []
+            }
+            pcks = []
+            pcks_05 = []
+            pcks_01 = []
+            for cat in categories:
+                # pdb.set_trace()
+                # files, kps, thresholds = load_spair_data(data_dir, size=img_size, category=cat, subsample=SAMPLE) if not PASCAL else load_pascal_data(data_dir, size=img_size, category=cat, subsample=SAMPLE)
+                if PASCAL:
+                    files, kps, thresholds = load_pascal_data(data_dir, size=img_size, category=cat, subsample=SAMPLE)
+                else:
+                    files, kps, thresholds = load_spair_data(data_dir, size=img_size, category=cat, subsample=SAMPLE)
+                    
+                if BBOX_THRE:
+                    pck = compute_pck(
+                        model, aug, save_path, files, kps, cat, mask=MASK, 
+                        dist=DIST, thresholds=thresholds, real_size=SIZE,
+                        layer=layer, facet=facet
+                    )
+                else:
+                    pck = compute_pck(
+                        model, aug, save_path, files, kps, cat,
+                        mask=MASK, dist=DIST, real_size=SIZE,
+                        layer=layer, facet=facet
+                    )
+                pcks.append(pck[0])
+                pcks_05.append(pck[1])
+                pcks_01.append(pck[2])
+                
+                config_pcks['PCK0.10'] += [pck[0]]
+                config_pcks['PCK0.05'] += [pck[1]]
+                config_pcks['PCK0.01'] += [pck[2]]
+                
+            config_pcks['PCK0.10'] += [np.average(pcks)]
+            config_pcks['PCK0.05'] += [np.average(pcks_05)]
+            config_pcks['PCK0.01'] += [np.average(pcks_01)]
             
-        if BBOX_THRE:
-            pck = compute_pck(model, aug, save_path, files, kps, cat, mask=MASK, dist=DIST, thresholds=thresholds, real_size=SIZE)
-        else:
-            pck = compute_pck(model, aug, save_path, files, kps, cat, mask=MASK, dist=DIST, real_size=SIZE)
-        pcks.append(pck[0])
-        pcks_05.append(pck[1])
-        pcks_01.append(pck[2])
-    end_time=time.time()
-    minutes, seconds = divmod(end_time-start_time, 60)
-    logger.info(f"Time: {minutes:.0f}m {seconds:.0f}s")
-    logger.info(f"Average PCK0.10: {np.average(pcks) * 100:.2f}")
-    logger.info(f"Average PCK0.05: {np.average(pcks_05) * 100:.2f}")
-    logger.info(f"Average PCK0.01: {np.average(pcks_01) * 100:.2f}") if not PASCAL else logger.info(f"Average PCK0.15: {np.average(pcks_01) * 100:.2f}")
+            end_time=time.time()
+            minutes, seconds = divmod(end_time-start_time, 60)
+            logger.info(f"Time: {minutes:.0f}m {seconds:.0f}s")
+            logger.info(f"Average PCK0.10: {np.average(pcks) * 100:.2f}")
+            logger.info(f"Average PCK0.05: {np.average(pcks_05) * 100:.2f}")
+            logger.info(f"Average PCK0.01: {np.average(pcks_01) * 100:.2f}") if not PASCAL else logger.info(f"Average PCK0.15: {np.average(pcks_01) * 100:.2f}")
+
+            # pdb.set_trace()
+            if best_pcks is None or best_pcks['PCK0.10'][-1] < config_pcks['PCK0.10'][-1]:
+                logger.info(f"New best PCK0.10: {config_pcks['PCK0.10'][-1] * 100:.2f}")
+                best_pcks = deepcopy(config_pcks)
+                best_pcks['layer'] = layer
+                best_pcks['facet'] = facet
+    
+    for idx in range(len(best_pcks['categories'])):
+        logger.info(f"{best_pcks['categories'][idx]}:")
+        logger.info(f"PCK0.10: {best_pcks['PCK0.10'][idx] * 100:.2f}")
+        logger.info(f"PCK0.05: {best_pcks['PCK0.05'][idx] * 100:.2f}")
+        logger.info(f"PCK0.01: {best_pcks['PCK0.01'][idx] * 100:.2f}")
+    logger.info(f"Best layer: {best_pcks['layer']}")
+    logger.info(f"Best facet: {best_pcks['facet']}")
+    
+    pcks = best_pcks['PCK0.10'][:-1]
+    pcks_05 = best_pcks['PCK0.05'][:-1]
+    pcks_01 = best_pcks['PCK0.01'][:-1]
+    
     if SAMPLE is None or SAMPLE==0:
         weights_pascal=[15,30,10,6,8,32,19,27,13,3,8,24,9,27,12,7,1,13,20,15]
         weights_spair=[690,650,702,702,870,644,564,600,646,640,600,600,702,650,862,664,756,692]
