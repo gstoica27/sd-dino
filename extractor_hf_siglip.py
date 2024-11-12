@@ -11,8 +11,11 @@ from pathlib import Path
 from typing import Union, List, Tuple
 from PIL import Image
 import os
+from transformers import AutoProcessor, AutoModel
+# from transformers import SiglipProcessor, SiglipModel
 
-class ViTExtractor:
+
+class SigLIPExtractor:
     """ This class facilitates extraction of features, descriptors, and saliency maps from a ViT.
     We use the following notation in the documentation of the module's methods:
     B - batch size
@@ -23,13 +26,13 @@ class ViTExtractor:
     d - the embedding dimension in the ViT.
     """
 
-    def __init__(self, model_type: str = 'dino_vits8', stride: int = 4, model: nn.Module = None, device: str = 'cuda'):
+    def __init__(self, model_type: str ="google/siglip-base-patch16-224", stride: int = 4, model: nn.Module = None, device: str = 'cuda'):
         """
         :param model_type: A string specifying the type of model to extract from.
                           [dino_vits8 | dino_vits16 | dino_vitb8 | dino_vitb16 | vit_small_patch8_224 |
                           vit_small_patch16_224 | vit_base_patch8_224 | vit_base_patch16_224]
         :param stride: stride of first convolution layer. small stride -> higher resolution.
-        :param model: Optional parameter. The nn.Module to extract from instead of creating a new one in ViTExtractor.
+        :param model: Optional parameter. The nn.Module to extract from instead of creating a new one in SigLIPExtractor.
                       should be compatible with model_type.
         """
         self.model_type = model_type
@@ -37,9 +40,9 @@ class ViTExtractor:
         if model is not None:
             self.model = model
         else:
-            self.model = ViTExtractor.create_model(model_type)
+            self.model = SigLIPExtractor.create_model(model_type).vision_model
 
-        self.model = ViTExtractor.patch_vit_resolution(self.model, stride=stride)
+        self.model = SigLIPExtractor.patch_vit_resolution(self.model, stride=stride)
         self.model.eval()
         self.model.to(self.device)
         self.p = self.model.patch_embed.patch_size
@@ -47,9 +50,8 @@ class ViTExtractor:
             self.p = self.p[0]
         self.stride = self.model.patch_embed.proj.stride
 
-        self.mean = (0.485, 0.456, 0.406) if "dino" in self.model_type else (0.5, 0.5, 0.5)
-        self.std = (0.229, 0.224, 0.225) if "dino" in self.model_type else (0.5, 0.5, 0.5)
-
+        processor = AutoProcessor.from_pretrained(model_type)
+        self.processor = lambda x: processor(x, return_tensors='pt')
         self._feats = []
         self.hook_handlers = []
         self.load_size = None
@@ -57,32 +59,7 @@ class ViTExtractor:
 
     @staticmethod
     def create_model(model_type: str) -> nn.Module:
-        """
-        :param model_type: a string specifying which model to load. [dino_vits8 | dino_vits16 | dino_vitb8 |
-                           dino_vitb16 | vit_small_patch8_224 | vit_small_patch16_224 | vit_base_patch8_224 |
-                           vit_base_patch16_224]
-        :return: the model
-        """
-        torch.hub.set_dir('/gscratch/krishna/gstoica3/.cache/torch/hub/')
-        os.makedirs('/gscratch/krishna/gstoica3/.cache/torch/hub/', exist_ok=True)
-        torch.hub._validate_not_a_forked_repo=lambda a,b,c: True
-        if 'v2' in model_type:
-            model = torch.hub.load('facebookresearch/dinov2', model_type)
-        elif 'dino' in model_type:
-            model = torch.hub.load('facebookresearch/dino:main', model_type)
-        else:  # model from timm -- load weights from timm to dino model (enables working on arbitrary size images).
-            temp_model = timm.create_model(model_type, pretrained=True)
-            model_type_dict = {
-            'vit_small_patch16_224': 'dino_vits16',
-            'vit_small_patch8_224': 'dino_vits8',
-            'vit_base_patch16_224': 'dino_vitb16',
-            'vit_base_patch8_224': 'dino_vitb8'
-            }
-            model = torch.hub.load('facebookresearch/dino:main', model_type_dict[model_type])
-            temp_state_dict = temp_model.state_dict()
-            del temp_state_dict['head.weight']
-            del temp_state_dict['head.bias']
-            model.load_state_dict(temp_state_dict)
+        model = AutoModel.from_pretrained(model_type)
         return model
 
     @staticmethod
@@ -95,11 +72,11 @@ class ViTExtractor:
         """
         def interpolate_pos_encoding(self, x: torch.Tensor, w: int, h: int) -> torch.Tensor:
             npatch = x.shape[1] - 1
-            N = self.pos_embed.shape[1] - 1
+            N = self.position_embedding.shape[1] - 1
             if npatch == N and w == h:
-                return self.pos_embed
-            class_pos_embed = self.pos_embed[:, 0]
-            patch_pos_embed = self.pos_embed[:, 1:]
+                return self.position_embedding
+            class_pos_embed = self.position_embedding[:, 0]
+            patch_pos_embed = self.position_embedding[:, 1:]
             dim = x.shape[-1]
             # compute number of tokens taking stride into account
             w0 = 1 + (w - patch_size) // stride_hw[1]
@@ -129,7 +106,7 @@ class ViTExtractor:
         :param stride: the new stride parameter.
         :return: the adjusted model
         """
-        patch_size = model.patch_embed.patch_size
+        patch_size = model.embeddings.patch_size
         if type(patch_size) == tuple:
             patch_size = patch_size[0]
         if stride == patch_size:  # nothing to do
@@ -140,9 +117,9 @@ class ViTExtractor:
                     stride]), f'stride {stride} should divide patch_size {patch_size}'
 
         # fix the stride
-        model.patch_embed.proj.stride = stride
+        model.embeddings.patch_embedding.stride = stride
         # fix the positional encoding code
-        model.interpolate_pos_encoding = types.MethodType(ViTExtractor._fix_pos_enc(patch_size, stride), model)
+        model.interpolate_pos_encoding = types.MethodType(SigLIPExtractor._fix_pos_enc(patch_size, stride), model)
         return model
 
     def preprocess(self, image_path: Union[str, Path],
@@ -155,23 +132,24 @@ class ViTExtractor:
                     (1) the preprocessed image as a tensor to insert the model of shape BxCxHxW.
                     (2) the pil image in relevant dimensions
         """
-        def divisible_by_num(num, dim):
-            return num * (dim // num)
-        pil_image = Image.open(image_path).convert('RGB')
-        if load_size is not None:
-            pil_image = transforms.Resize(load_size, interpolation=transforms.InterpolationMode.LANCZOS)(pil_image)
+        raise NotImplementedError
+        # def divisible_by_num(num, dim):
+        #     return num * (dim // num)
+        # pil_image = Image.open(image_path).convert('RGB')
+        # if load_size is not None:
+        #     pil_image = transforms.Resize(load_size, interpolation=transforms.InterpolationMode.LANCZOS)(pil_image)
 
-            width, height = pil_image.size
-            new_width = divisible_by_num(patch_size, width)
-            new_height = divisible_by_num(patch_size, height)
-            pil_image = pil_image.resize((new_width, new_height), resample=Image.LANCZOS)
+        #     width, height = pil_image.size
+        #     new_width = divisible_by_num(patch_size, width)
+        #     new_height = divisible_by_num(patch_size, height)
+        #     pil_image = pil_image.resize((new_width, new_height), resample=Image.LANCZOS)
             
-        prep = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=self.mean, std=self.std)
-        ])
-        prep_img = prep(pil_image)[None, ...]
-        return prep_img, pil_image
+        # prep = transforms.Compose([
+        #     transforms.ToTensor(),
+        #     transforms.Normalize(mean=self.mean, std=self.std)
+        # ])
+        # prep_img = prep(pil_image)[None, ...]
+        # return prep_img, pil_image
 
     def preprocess_pil(self, pil_image):
         """
@@ -182,12 +160,13 @@ class ViTExtractor:
                     (1) the preprocessed image as a tensor to insert the model of shape BxCxHxW.
                     (2) the pil image in relevant dimensions
         """
-        prep = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=self.mean, std=self.std)
-        ])
-        prep_img = prep(pil_image)[None, ...]
-        return prep_img
+        return self.processor(pil_image)[None, ...]
+        # prep = transforms.Compose([
+        #     transforms.ToTensor(),
+        #     transforms.Normalize(mean=self.mean, std=self.std)
+        # ])
+        # prep_img = prep(pil_image)[None, ...]
+        # return prep_img
 
     def _get_hook(self, facet: str):
         """
@@ -380,7 +359,7 @@ if __name__ == "__main__":
 
     with torch.no_grad():
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        extractor = ViTExtractor(args.model_type, args.stride, device=device)
+        extractor = SigLIPExtractor(args.model_type, args.stride, device=device)
         image_batch, image_pil = extractor.preprocess(args.image_path, args.load_size, args.patch_size)
         print(f"Image {args.image_path} is preprocessed to tensor of size {image_batch.shape}.")
         descriptors = extractor.extract_descriptors(image_batch.to(device), args.layer, args.facet, args.bin)

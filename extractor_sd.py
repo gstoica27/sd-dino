@@ -168,7 +168,8 @@ import sys
 
 def load_model(config_path="Panoptic/odise_label_coco_50e.py", seed=42, diffusion_ver="v1-3", image_size=1024, num_timesteps=0, block_indices=(2,5,8,11), decoder_only=True, encoder_only=False, resblock_only=False):
     cfg = model_zoo.get_config(config_path, trained=True)
-
+    # import os, pdb
+    # if os.path.exists('/mmfs1/home/gstoica3/.torch') and len(os.listdir('/mmfs1/home/gstoica3/.torch')) > 0: pdb.set_trace()
     cfg.model.backbone.feature_extractor.init_checkpoint = "sd://"+diffusion_ver
     cfg.model.backbone.feature_extractor.steps = (num_timesteps,)
     cfg.model.backbone.feature_extractor.unet_block_indices = block_indices
@@ -184,11 +185,17 @@ def load_model(config_path="Panoptic/odise_label_coco_50e.py", seed=42, diffusio
     dataset_cfg = cfg.dataloader.test
 
     aug = instantiate(dataset_cfg.mapper).augmentations
-
+    import os, pdb
+    # if os.path.exists('/mmfs1/home/gstoica3/.torch') and len(os.listdir('/mmfs1/home/gstoica3/.torch')) > 0: pdb.set_trace()
+    # pdb.set_trace()
     model = instantiate_odise(cfg.model)
+    # import os, pdb
+    # if os.path.exists('/mmfs1/home/gstoica3/.torch') and len(os.listdir('/mmfs1/home/gstoica3/.torch')) > 0: pdb.set_trace()
     model.to(cfg.train.device)
     ODISECheckpointer(model).load(cfg.train.init_checkpoint)
-
+    # import os, pdb
+    # if os.path.exists('/mmfs1/home/gstoica3/.torch') and len(os.listdir('/mmfs1/home/gstoica3/.torch')) > 0: pdb.set_trace()
+    # pdb.set_trace()
     return model, aug
 
 def inference(model, aug, image, vocab, label_list):

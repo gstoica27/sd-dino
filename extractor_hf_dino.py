@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Union, List, Tuple
 from PIL import Image
 import os
+from transformers import ViTModel, ViTImageProcessor
+import pdb
+
 
 class ViTExtractor:
     """ This class facilitates extraction of features, descriptors, and saliency maps from a ViT.
@@ -23,7 +26,11 @@ class ViTExtractor:
     d - the embedding dimension in the ViT.
     """
 
-    def __init__(self, model_type: str = 'dino_vits8', stride: int = 4, model: nn.Module = None, device: str = 'cuda'):
+    def __init__(
+        self, model_type: str = 'facebook/dino-vitb16', 
+        stride: int = 4, model: nn.Module = None, 
+        device: str = 'cuda'
+    ):
         """
         :param model_type: A string specifying the type of model to extract from.
                           [dino_vits8 | dino_vits16 | dino_vitb8 | dino_vitb16 | vit_small_patch8_224 |
@@ -37,19 +44,20 @@ class ViTExtractor:
         if model is not None:
             self.model = model
         else:
-            self.model = ViTExtractor.create_model(model_type)
-
+            self.model = ViTExtractor.create_model(model_type).to(device)
+        
+        processor = ViTImageProcessor.from_pretrained(model_type)
+        # pdb.set_trace()
         self.model = ViTExtractor.patch_vit_resolution(self.model, stride=stride)
         self.model.eval()
         self.model.to(self.device)
-        self.p = self.model.patch_embed.patch_size
+        self.p = self.model.embeddings.patch_size
         if type(self.p)==tuple:
             self.p = self.p[0]
-        self.stride = self.model.patch_embed.proj.stride
+        self.stride = self.model.embeddings.patch_embeddings.projection.stride
 
-        self.mean = (0.485, 0.456, 0.406) if "dino" in self.model_type else (0.5, 0.5, 0.5)
-        self.std = (0.229, 0.224, 0.225) if "dino" in self.model_type else (0.5, 0.5, 0.5)
-
+        
+        self.processor = lambda x: processor(x, return_tensors="pt")
         self._feats = []
         self.hook_handlers = []
         self.load_size = None
@@ -57,33 +65,7 @@ class ViTExtractor:
 
     @staticmethod
     def create_model(model_type: str) -> nn.Module:
-        """
-        :param model_type: a string specifying which model to load. [dino_vits8 | dino_vits16 | dino_vitb8 |
-                           dino_vitb16 | vit_small_patch8_224 | vit_small_patch16_224 | vit_base_patch8_224 |
-                           vit_base_patch16_224]
-        :return: the model
-        """
-        torch.hub.set_dir('/gscratch/krishna/gstoica3/.cache/torch/hub/')
-        os.makedirs('/gscratch/krishna/gstoica3/.cache/torch/hub/', exist_ok=True)
-        torch.hub._validate_not_a_forked_repo=lambda a,b,c: True
-        if 'v2' in model_type:
-            model = torch.hub.load('facebookresearch/dinov2', model_type)
-        elif 'dino' in model_type:
-            model = torch.hub.load('facebookresearch/dino:main', model_type)
-        else:  # model from timm -- load weights from timm to dino model (enables working on arbitrary size images).
-            temp_model = timm.create_model(model_type, pretrained=True)
-            model_type_dict = {
-            'vit_small_patch16_224': 'dino_vits16',
-            'vit_small_patch8_224': 'dino_vits8',
-            'vit_base_patch16_224': 'dino_vitb16',
-            'vit_base_patch8_224': 'dino_vitb8'
-            }
-            model = torch.hub.load('facebookresearch/dino:main', model_type_dict[model_type])
-            temp_state_dict = temp_model.state_dict()
-            del temp_state_dict['head.weight']
-            del temp_state_dict['head.bias']
-            model.load_state_dict(temp_state_dict)
-        return model
+        return ViTModel.from_pretrained(model_type)
 
     @staticmethod
     def _fix_pos_enc(patch_size: int, stride_hw: Tuple[int, int]):
@@ -93,13 +75,13 @@ class ViTExtractor:
         :param stride_hw: A tuple containing the new height and width stride respectively.
         :return: the interpolation method
         """
-        def interpolate_pos_encoding(self, x: torch.Tensor, w: int, h: int) -> torch.Tensor:
+        def interpolate_pos_encoding(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
             npatch = x.shape[1] - 1
-            N = self.pos_embed.shape[1] - 1
+            N = self.embeddings.position_embeddings.shape[1] - 1
             if npatch == N and w == h:
-                return self.pos_embed
-            class_pos_embed = self.pos_embed[:, 0]
-            patch_pos_embed = self.pos_embed[:, 1:]
+                return self.embeddings.position_embeddings
+            class_pos_embed = self.embeddings.position_embeddings[:, 0]
+            patch_pos_embed = self.embeddings.position_embeddings[:, 1:]
             dim = x.shape[-1]
             # compute number of tokens taking stride into account
             w0 = 1 + (w - patch_size) // stride_hw[1]
@@ -129,7 +111,7 @@ class ViTExtractor:
         :param stride: the new stride parameter.
         :return: the adjusted model
         """
-        patch_size = model.patch_embed.patch_size
+        patch_size = model.embeddings.patch_size
         if type(patch_size) == tuple:
             patch_size = patch_size[0]
         if stride == patch_size:  # nothing to do
@@ -140,9 +122,9 @@ class ViTExtractor:
                     stride]), f'stride {stride} should divide patch_size {patch_size}'
 
         # fix the stride
-        model.patch_embed.proj.stride = stride
+        model.embeddings.patch_embeddings.projection.stride = stride
         # fix the positional encoding code
-        model.interpolate_pos_encoding = types.MethodType(ViTExtractor._fix_pos_enc(patch_size, stride), model)
+        model.embeddings.interpolate_pos_encoding = types.MethodType(ViTExtractor._fix_pos_enc(patch_size, stride), model)
         return model
 
     def preprocess(self, image_path: Union[str, Path],
@@ -174,20 +156,8 @@ class ViTExtractor:
         return prep_img, pil_image
 
     def preprocess_pil(self, pil_image):
-        """
-        Preprocesses an image before extraction.
-        :param image_path: path to image to be extracted.
-        :param load_size: optional. Size to resize image before the rest of preprocessing.
-        :return: a tuple containing:
-                    (1) the preprocessed image as a tensor to insert the model of shape BxCxHxW.
-                    (2) the pil image in relevant dimensions
-        """
-        prep = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=self.mean, std=self.std)
-        ])
-        prep_img = prep(pil_image)[None, ...]
-        return prep_img
+        # pdb.set_trace()
+        return self.processor(pil_image)['pixel_values']
 
     def _get_hook(self, facet: str):
         """
@@ -195,39 +165,62 @@ class ViTExtractor:
         """
         if facet in ['attn', 'token']:
             def _hook(model, input, output):
-                self._feats.append(output)
+                self._feats.append(output[0])
             return _hook
 
         if facet == 'query':
-            facet_idx = 0
+            # facet_idx = 0
+            def _inner_hook(module, input, output):
+                input = input[0]
+                B, N, C = input.shape
+                outs = module.query(input)
+                self._feats.append(outs)
+                
         elif facet == 'key':
-            facet_idx = 1
+            # facet_idx = 1
+            def _inner_hook(module, input, output):
+                input = input[0]
+                B, N, C = input.shape
+                outs = module.key(input)
+                self._feats.append(outs)
         elif facet == 'value':
-            facet_idx = 2
+            # facet_idx = 2
+            def _inner_hook(module, input, output):
+                input = input[0]
+                B, N, C = input.shape
+                outs = module.value(input)
+                self._feats.append(outs)
         else:
             raise TypeError(f"{facet} is not a supported facet.")
 
-        def _inner_hook(module, input, output):
-            input = input[0]
-            B, N, C = input.shape
-            qkv = module.qkv(input).reshape(B, N, 3, module.num_heads, C // module.num_heads).permute(2, 0, 3, 1, 4)
-            self._feats.append(qkv[facet_idx]) #Bxhxtxd
+        # def _inner_hook(module, input, output):
+        #     input = input[0]
+        #     B, N, C = input.shape
+        #     qkv = module.qkv(input).reshape(B, N, 3, module.num_heads, C // module.num_heads).permute(2, 0, 3, 1, 4)
+        #     self._feats.append(qkv[facet_idx]) #Bxhxtxd
         return _inner_hook
 
     def _register_hooks(self, layers: List[int], facet: str) -> None:
         """
+        Assumption is that we are in the ViTLayer block.
+        attn: the actual attention softmax values
+        key: the key values
+        query: the query values
+        value: the value values
+        token: the output of the entire block (including the MLP)
+        
         register hook to extract features.
         :param layers: layers from which to extract features.
         :param facet: facet to extract. One of the following options: ['key' | 'query' | 'value' | 'token' | 'attn']
         """
-        for block_idx, block in enumerate(self.model.blocks):
+        for block_idx, block in enumerate(self.model.encoder.layer):
             if block_idx in layers:
                 if facet == 'token':
                     self.hook_handlers.append(block.register_forward_hook(self._get_hook(facet)))
                 elif facet == 'attn':
-                    self.hook_handlers.append(block.attn.attn_drop.register_forward_hook(self._get_hook(facet)))
+                    self.hook_handlers.append(block.attention.attention.dropout.register_forward_hook(self._get_hook(facet)))
                 elif facet in ['key', 'query', 'value']:
-                    self.hook_handlers.append(block.attn.register_forward_hook(self._get_hook(facet)))
+                    self.hook_handlers.append(block.attention.attention.register_forward_hook(self._get_hook(facet)))
                 else:
                     raise TypeError(f"{facet} is not a supported facet.")
 
@@ -250,10 +243,11 @@ class ViTExtractor:
                   if facet is 'attn' has shape Bxhxtxt
                   if facet is 'token' has shape Bxtxd
         """
+        # pdb.set_trace()
         B, C, H, W = batch.shape
         self._feats = []
         self._register_hooks(layers, facet)
-        _ = self.model(batch)
+        _ = self.model(pixel_values=batch, interpolate_pos_encoding=True)
         self._unregister_hooks()
         self.load_size = (H, W)
         self.num_patches = (1 + (H - self.p) // self.stride[0], 1 + (W - self.p) // self.stride[1])
@@ -321,8 +315,10 @@ class ViTExtractor:
                                                              choose from ['key' | 'query' | 'value' | 'token'] """
         self._extract_features(batch, [layer], facet)
         x = self._feats[0]
-        if facet == 'token':
-            x.unsqueeze_(dim=1) #Bx1xtxd
+        if len(x.shape) == 3 or facet == 'token':
+            x = x.unsqueeze(dim=1)
+        # if facet == 'token':
+        #     x.unsqueeze_(dim=1) #Bx1xtxd
         if not include_cls:
             x = x[:, :, 1:, :]  # remove cls token
         else:
