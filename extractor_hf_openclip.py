@@ -4,6 +4,7 @@ import torchvision.transforms
 from torch import nn
 from torchvision import transforms
 import torch.nn.modules.utils as nn_utils
+import torch.nn.functional as F
 import math
 import timm
 import types
@@ -13,6 +14,129 @@ from PIL import Image
 import os
 import open_clip
 import pdb
+from typing import Optional
+from copy import deepcopy
+from custom_attention import AttentionBlock
+
+
+class Attention(nn.Module):
+    # copied directly from openclip backend. Because nn.MultiheadAttention is really annoying
+    def __init__(
+            self,
+            module: torch.nn.Module,
+    ):
+        super().__init__()
+        if hasattr(module, 'in_proj_bias'):
+            self.bias = True
+
+        out_dim, in_dim = module.in_proj_weight.shape
+        hidden_dim = out_dim // 3
+        self.query = nn.Linear(in_dim, hidden_dim, bias=self.bias)
+        self.key = nn.Linear(in_dim, hidden_dim, bias=self.bias)
+        self.value = nn.Linear(in_dim, hidden_dim, bias=self.bias)
+        
+        # replace weights
+        self.query.weight.data = module.in_proj_weight[:hidden_dim, :]
+        self.key.weight.data = module.in_proj_weight[hidden_dim:2*hidden_dim, :]
+        self.value.weight.data = module.in_proj_weight[2*hidden_dim:, :]
+        if self.bias:
+            self.query.bias.data = module.in_proj_bias[:hidden_dim]
+            self.key.bias.data = module.in_proj_bias[hidden_dim:2*hidden_dim]
+            self.value.bias.data = module.in_proj_bias[2*hidden_dim:]
+            
+        self.out_proj = module.out_proj
+        self.out_drop = nn.Dropout(module.dropout)
+        self.batch_first = module.batch_first
+        self.num_heads = module.num_heads
+        
+        # self.debugging_module = module
+
+    def transpose_tokens(self, x):
+        x = x.transpose(0, 1)
+    
+    def forward(
+        self, q_x, k_x: Optional[torch.Tensor]=None, v_x: Optional[torch.Tensor]=None, 
+        attn_mask: Optional[torch.Tensor] = None, **kwargs
+    ):
+        # x = deepcopy(q_x) # [B,T,C]
+        if k_x is None:
+            k_x = deepcopy(q_x)
+            v_x = deepcopy(q_x)
+        pdb.set_trace()
+        if self.batch_first:
+            for elem in [q_x, k_x, v_x]:
+                self.transpose_tokens(elem)
+        
+        q = self.query(q_x)
+        k = self.key(k_x)
+        v = self.value(v_x)
+        
+        # if self.batch_first:
+        q = q.transpose(0, 1) # [T,B,C]
+        k = k.transpose(0, 1)
+        v = v.transpose(0, 1)
+        pdb.set_trace()
+        T, B, C = q.shape
+        # print("Q SHAPE: ", q.shape)
+        q = q.reshape(T, B * self.num_heads, -1).transpose(0, 1)
+        k = k.reshape(T, B * self.num_heads, -1).transpose(0, 1)
+        v = v.reshape(T, B * self.num_heads, -1).transpose(0, 1) # [BxnH,T,C/nH]
+
+        if attn_mask is not None and attn_mask.dtype == torch.bool:
+            pdb.set_trace()
+            new_attn_mask = torch.zeros_like(attn_mask, dtype=q.dtype)
+            new_attn_mask.masked_fill_(attn_mask, float("-inf"))
+            attn_mask = new_attn_mask
+
+        # x = F.scaled_dot_product_attention(
+        #     q, k, v,
+        #     attn_mask=attn_mask,
+        #     dropout_p=self.out_drop.p if self.training else 0.,
+        # )
+        # q = q * self.scale
+        attn = torch.bmm(q, k.transpose(-1, -2)) / math.sqrt(q.shape[-1])
+        if attn_mask is not None:
+            attn += attn_mask
+        attn = attn.softmax(dim=-1)
+        assert attn.shape[-1] == T
+        # attn = self.attn_drop(attn)
+        x = torch.bmm(attn, v)
+        x = x.transpose(1, 0).reshape(T, B, self.num_heads, -1).flatten(2)
+        # x = x.reshape(T, B, C)
+
+        if self.batch_first:
+            x = x.transpose(0, 1)
+
+        x = self.out_proj(x)
+        x = self.out_drop(x)
+        
+        # debugging_x = self.debugging_module(q_x, k_x, v_x, attn_mask=attn_mask, **kwargs)
+        # if not torch.allclose(debugging_x[0], x):
+        #     pdb.set_trace()
+        # pdb.set_trace()
+        return (x, None)
+    
+
+def recursively_setattr(model, key, new_module):
+        stages = key.split('.')
+        x = getattr(model, stages[0])
+        for stage in stages[1:-1]:
+            if stage in [str(i) for i in range(20)]:
+                x = x[int(stage)]
+                continue
+            x = getattr(x, stage)
+        # pdb.set_trace()
+        setattr(x, stages[-1], new_module)
+
+
+def replace_attention_layers(model, attention_layers):
+    for key, module in attention_layers.items():
+        if isinstance(module, torch.nn.Identity):
+            pdb.set_trace()
+        new_module = Attention(module)
+        # new_module = AttentionBlock(module)
+        recursively_setattr(model, key, new_module)
+    return model
 
 
 class ViTExtractor:
@@ -29,7 +153,8 @@ class ViTExtractor:
     def __init__(
         self, model_type: tuple =('ViT-B-16', 'laion400m_e31'), 
         stride: int = 4, model: nn.Module = None, 
-        device: str = 'cuda'
+        device: str = 'cuda',
+        model_load_path: Optional[str] = None,
     ):
         """
         :param model_type: A string specifying the type of model to extract from.
@@ -44,11 +169,21 @@ class ViTExtractor:
         if model is not None:
             self.model = model
         else:
-            self.model = self.create_model(model_type)
+            self.model = self.create_model(model_type, model_load_path)
             # pdb.set_trace()
+            # TODO: DELETE THESE LINES
+            # temp_sd = torch.load(
+            #     '/mmfs1/gscratch/krishna/gstoica3/research/sd-dino/checkpoints/clip_key_merged_with_dino.pth'
+            # )
+            # self.model.transformer.resblocks[9].attn.key.weight.data = (
+            #     temp_sd['transformer.resblocks.9.attn.key.weight']
+            # )
+            # self.model.transformer.resblocks[9].attn.key.bias.data = (
+            #     temp_sd['transformer.resblocks.9.attn.key.bias']
+            # )
+            ##################################################################
             # self.model = self.model
         
-        # pdb.set_trace()
         self.model = ViTExtractor.patch_vit_resolution(self.model, stride=stride)
         self.model.eval()
         self.model.to(self.device)
@@ -63,10 +198,42 @@ class ViTExtractor:
         self.hook_handlers = []
         self.load_size = None
         self.num_patches = None
+        
+    def subselect_from_state_dict(self, state_dict):
+        state_dict_keys = list(state_dict.keys())
+        if any(['visual.model' in key for key in state_dict_keys]):
+            new_state_dict = {}
+            for key in state_dict_keys:
+                if 'visual.model' in key:
+                    new_state_dict[key.replace('visual.model.', '')] = state_dict[key]
+            return new_state_dict
+        else:
+            return state_dict
+    
+    def correct_state_dict(self, load_path):
+        state_dict = self.subselect_from_state_dict(torch.load(load_path, map_location='cuda:0'))
+        new_state_dict = {}
+        # pdb.set_trace()
+        for k, v in state_dict.items():
+            new_k = k.replace('model.', '')
+            # new_k = new_k.replace('compute_mha', 'attention')
+            # new_k = new_k.replace('attn.out_proj', 'attn.merge_heads.out_proj')
+            # new_k = new_k.replace('compute_mha.', '')
+            new_k = new_k.replace('attn.attention', 'attn')
+            new_k = new_k.replace('attn.merge_heads', 'attn')
+            new_state_dict[new_k] = v
+        return new_state_dict
 
-    @staticmethod
-    def create_model(model_type: str) -> nn.Module:
-        return open_clip.create_model_and_transforms(model_type[0], pretrained=model_type[1])[0].visual
+    
+    def create_model(self, model_type: str, load_path: Optional[str]=None) -> nn.Module:
+        model =  open_clip.create_model_and_transforms(model_type[0], pretrained=model_type[1])[0].visual
+        attention_layers = {key: module for key, module in model.named_modules() if key.endswith('.attn')}
+        model = replace_attention_layers(model, attention_layers)
+        if load_path is not None:
+            out = model.load_state_dict(self.correct_state_dict(load_path), strict=False)
+            print(out)
+            print("Loaded model from ", load_path)
+        return model
 
     @staticmethod
     def _fix_pos_enc(patch_size: int, stride_hw: Tuple[int, int]):
@@ -118,10 +285,10 @@ class ViTExtractor:
         # x = x + self.positional_embedding.to(x.dtype)
         x = x + self.interpolate_pos_encoding(x, height, width)
         x = self.ln_pre(x)
-
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        # pdb.set_trace()
+        # x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
+        # x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
 
@@ -137,6 +304,7 @@ class ViTExtractor:
         :param stride: the new stride parameter.
         :return: the adjusted model
         """
+        # pdb.set_trace()
         patch_size = model.patch_size
         if type(patch_size) == tuple:
             patch_size = patch_size[0]
@@ -195,37 +363,63 @@ class ViTExtractor:
                 self._feats.append(output.permute(1, 0, 2))
             return _hook
 
-        if facet == 'query':
-            # facet_idx = 0
+        # if facet == 'key':
+        #      def _inner_hook(module, input, output):
+        #         input = input[0]#.permute(1, 0, 2)
+        #         N, B, C = input.shape
+        #         qkv_weight = module.in_proj_weight
+        #         qkv_bias = module.in_proj_bias
+        #         outs = torch.nn.functional.linear(input, qkv_weight[:C, :], qkv_bias[:C]).reshape(N, B, module.num_heads, -1).permute(1, 2, 0, 3)
+        #         self._feats.append(outs)
+        
+        # elif facet == 'query':
+        #      def _inner_hook(module, input, output):
+        #         input = input[0]#.permute(1, 0, 2)
+        #         N, B, C = input.shape
+        #         qkv_weight = module.in_proj_weight
+        #         qkv_bias = module.in_proj_bias
+        #         outs = torch.nn.functional.linear(input, qkv_weight[C:2*C], qkv_bias[C:2*C]).reshape(N, B, module.num_heads, -1).permute(1, 2, 0, 3)
+        #         self._feats.append(outs)
+            
+        # elif facet == 'value':
+        #      def _inner_hook(module, input, output):
+        #         input = input[0]#.permute(1, 0, 2)
+        #         # print("The shape of OpenCLIP the qkv hook inputs is: ", input.shape)
+        #         N, B, C = input.shape
+        #         qkv_weight = module.in_proj_weight
+        #         qkv_bias = module.in_proj_bias
+        #         outs = torch.nn.functional.linear(input, qkv_weight[2*C:], qkv_bias[2*C:]).reshape(N, B, module.num_heads, -1).permute(1, 2, 0, 3)
+        #         # print("The shape of OpenCLIP the qkv hook outs is: ", outs.shape)
+        #         # print("outs is: ", outs)
+        #         self._feats.append(outs)
+            
+            
+            
+        
+        if facet in ['query', 'key', 'value']:
             def _inner_hook(module, input, output):
-                input = input[0].permute(1, 0, 2)
-                B, N, C = input.shape
-                
-                qkv_weight = module.in_proj_weight
-                qkv_bias = module.in_proj_bias
-                outs = torch.nn.functional.linear(input, qkv_weight[:C, :], qkv_bias[:C]).reshape(B, N, module.num_heads, -1).permute(0, 2, 1, 3)
+                # input = input[0].permute(1, 0, 2)
+                # qkv_weight = module.in_proj_weight
+                # qkv_bias = module.in_proj_bias
+                # outs = torch.nn.functional.linear(input, qkv_weight[:C, :], qkv_bias[:C]).reshape(N, B, module.num_heads, -1).permute(1, 2, 0, 3)
+                print(output.shape)
+                B, N, C = output.shape
+                # [H, T, B, D]. Should be: # [B, H, T, C]
+                # 1, 12, 2810, 64
+                # outs = output.reshape(B, N, 12, -1).permute(1, 2, 0, 3)
+                outs = output.reshape(B, N, 12, -1).transpose(1, 2)
+                print("The shape of OpenCLIP the qkv hook outputs is: ", outs.shape)
                 self._feats.append(outs)
-                
-        elif facet == 'key':
-            # facet_idx = 1
-            def _inner_hook(module, input, output):
-                input = input[0].permute(1, 0, 2)
-                B, N, C = input.shape
-                qkv_weight = module.in_proj_weight
-                qkv_bias = module.in_proj_bias
-                # print("Input SHAPE: {}".format(input.shape))
-                # print("QKV WEIGHT SHAPE: {}".format(qkv_weight.shape))
-                outs = torch.nn.functional.linear(input, qkv_weight[C:2*C, :], qkv_bias[C:2*C]).reshape(B, N, module.num_heads, -1).permute(0, 2, 1, 3)
-                self._feats.append(outs)
-        elif facet == 'value':
-            # facet_idx = 2
-            def _inner_hook(module, input, output):
-                input = input[0].permute(1, 0, 2)
-                B, N, C = input.shape
-                qkv_weight = module.in_proj_weight
-                qkv_bias = module.in_proj_bias
-                outs = torch.nn.functional.linear(input, qkv_weight[2*C:, :], qkv_bias[2*C:]).reshape(B, N, module.num_heads, -1).permute(0, 2, 1, 3)
-                self._feats.append(outs)
+        # elif facet == 'qkv':
+        #     def _inner_hook(module, input, output):
+        #         input = input[0]
+        #         N, B, C = input.shape
+        #         qkv_weight = module.in_proj_weight
+        #         qkv_bias = module.in_proj_bias
+        #         # print("The shape of OpenCLIP the qkv hook inputs is: ", input.shape)
+        #         outputs = torch.nn.functional.linear(input, qkv_weight, qkv_bias).reshape(N, B, 3, module.num_heads, -1).permute(1, 3, 0, 2, 4).flatten(3, 4)
+        #         # print("The shape of OpenCLIP the qkv hook outputs is: ", outputs.shape)
+        #         self._feats.append(outputs)
         else:
             raise TypeError(f"{facet} is not a supported facet.")
 
@@ -253,11 +447,36 @@ class ViTExtractor:
             if block_idx in layers:
                 if facet == 'token':
                     self.hook_handlers.append(block.register_forward_hook(self._get_hook(facet)))
+                    self.hook_module_name = f'transformer.resblocks.{block_idx}'
                 elif facet == 'attn':
                     self.hook_handlers.append(block.ln_attn.register_forward_hook(self._get_hook(facet)))
-                elif facet in ['key', 'query', 'value']:
-                    # print(block.attn.in_proj_weight.shape)
-                    self.hook_handlers.append(block.attn.register_forward_hook(self._get_hook(facet)))
+                    self.hook_module_name = f'transformer.resblocks.{block_idx}.attn.out_proj'
+                # elif facet in ['key', 'query', 'value']:
+                #     # print(block.attn.in_proj_weight.shape)
+                #     self.hook_handlers.append(block.attn.register_forward_hook(self._get_hook(facet)))
+                #     self.hook_module_name = f'transformer.resblocks.{block_idx}.attn.{facet}'
+                elif facet == 'key':
+                    try:
+                        self.hook_handlers.append(block.attn.key.register_forward_hook(self._get_hook(facet)))
+                    except:
+                        self.hook_handlers.append(block.attn.attention.key.register_forward_hook(self._get_hook(facet)))
+                    self.hook_module_name = f'transformer.resblocks.{block_idx}.attn.{facet}'
+                    # pdb.set_trace()
+                elif facet == 'query':
+                    try:
+                        self.hook_handlers.append(block.attn.query.register_forward_hook(self._get_hook(facet)))
+                    except:
+                        self.hook_handlers.append(block.attn.attention.query.register_forward_hook(self._get_hook(facet)))
+                    self.hook_module_name = f'transformer.resblocks.{block_idx}.attn.{facet}'
+                elif facet == 'value':
+                    try:
+                        self.hook_handlers.append(block.attn.value.register_forward_hook(self._get_hook(facet)))
+                    except:
+                        self.hook_handlers.append(block.attn.attention.value.register_forward_hook(self._get_hook(facet)))
+                    self.hook_module_name = f'transformer.resblocks.{block_idx}.attn.{facet}'
+                # elif facet == 'qkv':
+                #     self.hook_handlers.append(block.attn.register_forward_hook(self._get_hook(facet)))
+                #     self.hook_module_name = f'transformer.resblocks.{block_idx}.attn'
                 else:
                     raise TypeError(f"{facet} is not a supported facet.")
 
@@ -348,13 +567,20 @@ class ViTExtractor:
         :param bin: apply log binning to the descriptor. default is False.
         :return: tensor of descriptors. Bx1xtxd' where d' is the dimension of the descriptors.
         """
-        assert facet in ['key', 'query', 'value', 'token'], f"""{facet} is not a supported facet for descriptors. 
+        assert facet in ['key', 'query', 'value', 'token', 'qkv'], f"""{facet} is not a supported facet for descriptors. 
                                                              choose from ['key' | 'query' | 'value' | 'token'] """
         self._extract_features(batch, [layer], facet)
-        # pdb.set_trace()
         x = self._feats[0]
         if facet == 'token':
-            x.unsqueeze_(dim=1) #Bx1xtxd
+            pdb.set_trace()
+            x = x.transpose(0, 1).unsqueeze(dim=1) #Bx1xtxd
+        # else:
+            # x = x.)
+        if not (
+            x.shape[0] == 1 and \
+            x.shape[2] == 2810
+        ):
+            pdb.set_trace()
         # if facet == 'token':
         #     x.unsqueeze_(dim=1) #Bx1xtxd
         if not include_cls:

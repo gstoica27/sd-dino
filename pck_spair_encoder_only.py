@@ -165,7 +165,8 @@ def load_pascal_data(path, size=256, category='cat', split='test', subsample=Non
 def compute_pck(
     model, aug, save_path, files, kps, category, 
     mask=False, dist='cos', thresholds=None, 
-    real_size=960, layer=9, facet='key'
+    real_size=960, layer=9, facet='key',
+    output_transform=None
 ):
     
     img_size = 224
@@ -179,27 +180,37 @@ def compute_pck(
     }
     
     model_type = model_dict[MODEL_SIZE]# if DINOV2 else 'dino_vits8'
+    # TODO: DELETE
     # layer = 11 if DINOV2 else 9
+    # facet = 'token' if DINOV2 else 'key'
     if 'l' in model_type:
         layer = 23
     elif 'g' in model_type:
         layer = 39
-    # facet = 'token' if DINOV2 else 'key'
-    stride = 4
+    # stride = 4
+    stride = 14 if DINOV2 else 4 if ONLY_DINO else 8
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # indiactor = 'v2' if DINOV2 else 'v1'
     # model_size = model_type.split('vit')[-1]
+    if output_transform is not None:
+        output_transform['layer'] = layer
+        output_transform['facet'] = facet
     if 'hf_dinov1_vitb16' == MODEL_SIZE:
         logger.info("Using HF DINOv1 model")
-        extractor = ViTExtractorHF(model_type, stride, device=device)
-        patch_size = extractor.model.embeddings.patch_size
+        extractor = ViTExtractorHF(
+            model_type, stride, device=device, model_load_path=MODEL_LOAD_PATH, 
+            output_transform=output_transform, model_load_type=MODEL_LOAD_TYPE
+        )
+        # pdb.set_trace()
+        patch_size = extractor.model.embeddings.patch_embeddings.patch_size[0]
     elif 'openclip_vitb16' == MODEL_SIZE:
         logger.info("Using OpenClip model")
-        extractor = OpenClipExtractorHF(model_type, stride, device=device)
+        extractor = OpenClipExtractorHF(model_type, stride, device=device, model_load_path=MODEL_LOAD_PATH)
         patch_size = extractor.model.patch_size[0]
     else:
         extractor = ViTExtractor(model_type, stride, device=device)
-        patch_size = extractor.model.embeddings.patch_size
+        # patch_size = extractor.model.embeddings.patch_size
+        patch_size = extractor.model.patch_embed.patch_size[0] if DINOV2 else extractor.model.patch_embed.patch_size
     num_patches = int(patch_size / stride * (img_size // patch_size - 1) + 1)
     
     input_text = "a photo of "+category if TEXT_INPUT else None
@@ -241,19 +252,19 @@ def compute_pck(
 
         # pdb.set_trace()
         with torch.no_grad():
-            if not CO_PCA:
-                # if FUSE_DINO:
-                img1_batch = extractor.preprocess_pil(img1)
-                img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
-                img2_batch = extractor.preprocess_pil(img2)
-                img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
+            # if not CO_PCA:
+            #     # if FUSE_DINO:
+            #     img1_batch = extractor.preprocess_pil(img1)
+            #     img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
+            #     img2_batch = extractor.preprocess_pil(img2)
+            #     img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
 
-            else:
-                # if FUSE_DINO:
-                img1_batch = extractor.preprocess_pil(img1)
-                img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
-                img2_batch = extractor.preprocess_pil(img2)
-                img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
+            # else:
+            # if FUSE_DINO:
+            img1_batch = extractor.preprocess_pil(img1)
+            img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
+            img2_batch = extractor.preprocess_pil(img2)
+            img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
             
             if CO_PCA_DINO:
                 cat_desc_dino = torch.cat((img1_desc_dino, img2_desc_dino), dim=2).squeeze() # (1, 1, num_patches**2, dim)
@@ -280,6 +291,7 @@ def compute_pck(
             img1_desc = img1_desc_dino
             img2_desc = img2_desc_dino
         # logger.info(img1_desc.shape, img2_desc.shape)
+            pdb.set_trace()
 
             if DRAW_DENSE:
                 mask1 = get_mask(model, aug, img1, category)
@@ -340,9 +352,11 @@ def compute_pck(
         if COUNT_INVIS:
             vis = torch.ones_like(vis)
         # Get similarity matrix
-        # pdb.set_trace()
         if dist == 'cos':
-            sim_1_to_2 = chunk_cosine_sim(img1_desc, img2_desc).squeeze()
+            try:
+                sim_1_to_2 = chunk_cosine_sim(img1_desc, img2_desc).squeeze()
+            except:
+                pdb.set_trace()
         elif dist == 'l2':
             sim_1_to_2 = pairwise_sim(img1_desc, img2_desc, p=2).squeeze()
         elif dist == 'l1':
@@ -410,7 +424,13 @@ def compute_pck(
     return correct
 
 def main(args):
-    global MASK, SAMPLE, DIST, COUNT_INVIS, TOTAL_SAVE_RESULT, BBOX_THRE, VER, CO_PCA, PCA_DIMS, SIZE, FUSE_DINO, DINOV2, MODEL_SIZE, DRAW_DENSE, TEXT_INPUT, DRAW_SWAP, ONLY_DINO, SEED, EDGE_PAD, WEIGHT, CO_PCA_DINO, PASCAL, DRAW_GIF, RAW
+    global \
+        MASK, SAMPLE, DIST, COUNT_INVIS, TOTAL_SAVE_RESULT, \
+        BBOX_THRE, VER, CO_PCA, PCA_DIMS, SIZE, FUSE_DINO, \
+        DINOV2, MODEL_SIZE, DRAW_DENSE, TEXT_INPUT, DRAW_SWAP, \
+        ONLY_DINO, SEED, EDGE_PAD, WEIGHT, CO_PCA_DINO, PASCAL, \
+        DRAW_GIF, RAW, MODEL_LOAD_PATH, OUTPUT_TRANSFORM, \
+        MODEL_LOAD_TYPE
     MASK = args.MASK
     SAMPLE = args.SAMPLE
     DIST = args.DIST
@@ -429,6 +449,8 @@ def main(args):
     ONLY_DINO = args.ONLY_DINO
     DINOV2 = False if args.DINOV1 else True
     MODEL_SIZE = args.MODEL_SIZE
+    MODEL_LOAD_PATH = args.MODEL_LOAD_PATH
+    MODEL_LOAD_TYPE = args.MODEL_LOAD_TYPE
     
     DRAW_DENSE = args.DRAW_DENSE
     DRAW_SWAP = args.DRAW_SWAP
@@ -439,10 +461,22 @@ def main(args):
     WEIGHT = args.WEIGHT # corresponde to three groups for the sd features, and one group for the dino features
     PASCAL = args.PASCAL
     RAW = args.RAW
-    
+    # Output transforms
+    OUTPUT_TRANSFORM = None
+    if args.output_transform_type is not None:
+        OUTPUT_TRANSFORM = {'type': args.output_transform_type}
+    if args.output_transform_scale is not None and OUTPUT_TRANSFORM is not None:
+        OUTPUT_TRANSFORM['scale'] = args.output_transform_scale
+    if args.transform_load_path is not None and OUTPUT_TRANSFORM is not None:
+        OUTPUT_TRANSFORM['load_path'] = args.transform_load_path
+    print("Output Transform: ", OUTPUT_TRANSFORM)
     LAYERS = [2, 5, 8, 9, 10, 11]
     # LAYERS = [9, 10, 11]
+    # LAYERS = [9]
     FACETS = ['key', 'query', 'value', 'token'][::-1]
+    # FACETS = ['key', 'query', 'value'][::-1]
+    # FACETS = ['key']
+    # FACETS = ['key']
     
     if SAMPLE == 0:
         SAMPLE = None
@@ -489,8 +523,8 @@ def main(args):
                     'bus', 'car', 'cat', 'chair', 'cow',
                     'diningtable', 'dog', 'horse', 'motorbike', 'person',
                     'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'] # for pascal
-    # img_size = 840 if DINOV2 else 224 if ONLY_DINO else 480
-    img_size = 224
+    img_size = 840 if DINOV2 else 224 if ONLY_DINO else 480
+    # img_size = 224
     best_pcks = None
     start_time=time.time()
     for layer in LAYERS:
@@ -518,13 +552,15 @@ def main(args):
                     pck = compute_pck(
                         model, aug, save_path, files, kps, cat, mask=MASK, 
                         dist=DIST, thresholds=thresholds, real_size=SIZE,
-                        layer=layer, facet=facet
+                        layer=layer, facet=facet, 
+                        output_transform=OUTPUT_TRANSFORM
                     )
                 else:
                     pck = compute_pck(
                         model, aug, save_path, files, kps, cat,
                         mask=MASK, dist=DIST, real_size=SIZE,
-                        layer=layer, facet=facet
+                        layer=layer, facet=facet, 
+                        output_transform=OUTPUT_TRANSFORM
                     )
                 pcks.append(pck[0])
                 pcks_05.append(pck[1])
@@ -573,6 +609,7 @@ def main(args):
     logger.info(f"Weighted PCK0.10: {np.average(pcks, weights=weights) * 100:.2f}")
     logger.info(f"Weighted PCK0.05: {np.average(pcks_05, weights=weights) * 100:.2f}")
     logger.info(f"Weighted PCK0.01: {np.average(pcks_01, weights=weights) * 100:.2f}") if not PASCAL else logger.info(f"Weighted PCK0.15: {np.average(pcks_01, weights=weights) * 100:.2f}")
+    return best_pcks
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -598,6 +635,8 @@ if __name__ == '__main__':
     parser.add_argument('--ONLY_DINO', action='store_true', default=False)          # set true to use only dino features
     parser.add_argument('--DINOV1',  action='store_true', default=False)            # set true to use dinov1
     parser.add_argument('--MODEL_SIZE', type=str, default='base')                   # model size of thye dinov2, small, base, large
+    parser.add_argument('--MODEL_LOAD_PATH', nargs='?', default=None)                   # model size of thye dinov2, small, base, large
+    parser.add_argument('--MODEL_LOAD_TYPE', type=str, default=None)
 
     parser.add_argument('--DRAW_DENSE', action='store_true', default=False)         # set true to draw the dense correspondences
     parser.add_argument('--DRAW_SWAP', action='store_true', default=False)          # set true to draw the swapped images
@@ -606,6 +645,11 @@ if __name__ == '__main__':
 
     parser.add_argument('--PASCAL', action='store_true', default=False)             # set true to test on pfpascal dataset
     parser.add_argument('--NOTE', type=str, default='')
+    parser.add_argument('--output_transform_type', type=str, default=None)
+    parser.add_argument('--output_transform_scale', type=float, default=None)
+    # parser.add_arguent('--output_transform_bias', action='store_true', default=False)
+    parser.add_argument('--transform_load_path', type=str, default=None)
+    
 
     args = parser.parse_args()
     main(args)

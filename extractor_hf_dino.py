@@ -13,6 +13,9 @@ from PIL import Image
 import os
 from transformers import ViTModel, ViTImageProcessor
 import pdb
+from feature_transforms import *
+from utils.custom_models import load_clip_into_dino
+from typing import Optional
 
 
 class ViTExtractor:
@@ -29,7 +32,8 @@ class ViTExtractor:
     def __init__(
         self, model_type: str = 'facebook/dino-vitb16', 
         stride: int = 4, model: nn.Module = None, 
-        device: str = 'cuda'
+        device: str = 'cuda', model_load_path=None,
+        output_transform=None, model_load_type=None
     ):
         """
         :param model_type: A string specifying the type of model to extract from.
@@ -44,14 +48,14 @@ class ViTExtractor:
         if model is not None:
             self.model = model
         else:
-            self.model = ViTExtractor.create_model(model_type).to(device)
+            self.model = ViTExtractor.create_model(model_type, load_path=model_load_path, load_type=model_load_type).to(device)
         
         processor = ViTImageProcessor.from_pretrained(model_type)
         # pdb.set_trace()
         self.model = ViTExtractor.patch_vit_resolution(self.model, stride=stride)
         self.model.eval()
         self.model.to(self.device)
-        self.p = self.model.embeddings.patch_size
+        self.p = self.model.embeddings.patch_embeddings.patch_size
         if type(self.p)==tuple:
             self.p = self.p[0]
         self.stride = self.model.embeddings.patch_embeddings.projection.stride
@@ -62,10 +66,50 @@ class ViTExtractor:
         self.hook_handlers = []
         self.load_size = None
         self.num_patches = None
+        
+        self.output_transform = self.compute_output_transform(output_transform)
+    
+    def get_layer_info(self, layer: int, facet:str):
+        block = self.model.encoder.layer[layer]
+        if facet == 'token':
+            module = block.output.dense
+            return {'dim': module.weight.shape[0], 'num_heads': 1}
+        elif facet == 'key':
+            # pdb.set_trace()
+            module = block.attention.attention.key
+            return {'dim': module.weight.shape[0], 'num_heads': block.attention.attention.num_attention_heads}
+        elif facet == 'query':
+            module = block.attention.attention.query
+            return {'dim': module.weight.shape[0], 'num_heads': block.attention.attention.num_attention_heads}
+        elif facet == 'value':
+            module = block.attention.attention.value
+            return {'dim': module.weight.shape[0], 'num_heads': block.attention.attention.num_attention_heads}
+        else:
+            raise TypeError(f"{facet} is not a supported facet.")
+    
+    
+    def compute_output_transform(self, output_transform):
+        if output_transform is None:
+            return lambda x: x
+        if output_transform['facet'] in {'key', 'value', 'query'}:
+            # Compute a block diagonal invertible tranformation
+            layer_info = self.get_layer_info(
+                output_transform['layer'], output_transform['facet']
+            )
+            # pdb.set_trace()
+            return Transform(output_transform, layer_info)
+        else:
+            raise ValueError(
+                'Unknown output transform type: {}'.format(output_transform['facet'])
+            )
 
     @staticmethod
-    def create_model(model_type: str) -> nn.Module:
-        return ViTModel.from_pretrained(model_type)
+    def create_model(model_type: str, load_path: Optional[str]=None, load_type:Optional[str]=None) -> nn.Module:
+        model = ViTModel.from_pretrained(model_type)
+        # pdb.set_trace()
+        if load_path is not None and load_type == 'clip':
+            model = load_clip_into_dino(model, load_path)
+        return model
 
     @staticmethod
     def _fix_pos_enc(patch_size: int, stride_hw: Tuple[int, int]):
@@ -111,7 +155,8 @@ class ViTExtractor:
         :param stride: the new stride parameter.
         :return: the adjusted model
         """
-        patch_size = model.embeddings.patch_size
+        # pdb.set_trace()
+        patch_size = model.embeddings.patch_embeddings.patch_size
         if type(patch_size) == tuple:
             patch_size = patch_size[0]
         if stride == patch_size:  # nothing to do
@@ -163,9 +208,17 @@ class ViTExtractor:
         """
         generate a hook method for a specific block and facet.
         """
+        
+        def extract_heads(module, x):
+            B, N, C = x.shape
+            # return x.reshape(B, N, module.num_heads, C // module.num_heads).permute(0, 2, 1, 3)
+            x = self.output_transform(x)
+            return module.transpose_for_scores(x)
+        
         if facet in ['attn', 'token']:
-            def _hook(model, input, output):
-                self._feats.append(output[0])
+            def _hook(module, input, output):
+                x = self.output_transform(output[0])
+                self._feats.append(x)
             return _hook
 
         if facet == 'query':
@@ -173,7 +226,7 @@ class ViTExtractor:
             def _inner_hook(module, input, output):
                 input = input[0]
                 B, N, C = input.shape
-                outs = module.query(input)
+                outs = extract_heads(module, module.query(input))
                 self._feats.append(outs)
                 
         elif facet == 'key':
@@ -181,14 +234,26 @@ class ViTExtractor:
             def _inner_hook(module, input, output):
                 input = input[0]
                 B, N, C = input.shape
-                outs = module.key(input)
+                outs = extract_heads(module, module.key(input))
+                # print("The shape of DiNO the key hook outputs is: ", outs.shape)
                 self._feats.append(outs)
         elif facet == 'value':
             # facet_idx = 2
             def _inner_hook(module, input, output):
                 input = input[0]
                 B, N, C = input.shape
-                outs = module.value(input)
+                outs = extract_heads(module, module.value(input))
+                self._feats.append(outs)
+        elif facet == 'qkv':
+            def _inner_hook(module, input, output):
+                input = input[0]
+                B, N, C = input.shape
+                # print("The shape of DiNO the qkv hook inputs is: ", input.shape)
+                queries = extract_heads(module, module.query(input))
+                keys = extract_heads(module, module.key(input))
+                values = extract_heads(module, module.value(input))
+                outs = torch.cat((queries, keys, values), dim=-1)
+                # print("The shape of DiNO the qkv hook outputs is: ", outs.shape)
                 self._feats.append(outs)
         else:
             raise TypeError(f"{facet} is not a supported facet.")
@@ -211,16 +276,22 @@ class ViTExtractor:
         
         register hook to extract features.
         :param layers: layers from which to extract features.
-        :param facet: facet to extract. One of the following options: ['key' | 'query' | 'value' | 'token' | 'attn']
+        :param facet: facet to extract. One of the following options: ['key' | 'query' | 'value' | 'token' | 'attn' | 'qkv']
         """
         for block_idx, block in enumerate(self.model.encoder.layer):
             if block_idx in layers:
                 if facet == 'token':
                     self.hook_handlers.append(block.register_forward_hook(self._get_hook(facet)))
+                    self.hook_module_name = f'encoder.layer.{block_idx}'
                 elif facet == 'attn':
                     self.hook_handlers.append(block.attention.attention.dropout.register_forward_hook(self._get_hook(facet)))
+                    self.hook_module_name = f'encoder.layer.{block_idx}.attention.attention.output.dense'
                 elif facet in ['key', 'query', 'value']:
                     self.hook_handlers.append(block.attention.attention.register_forward_hook(self._get_hook(facet)))
+                    self.hook_module_name = f'encoder.layer.{block_idx}.attention.attention.{facet}'
+                elif facet == 'qkv': # TODO: Remove this next iteration of SAE experiments
+                    self.hook_handlers.append(block.attention.attention.register_forward_hook(self._get_hook(facet)))
+                    self.hook_module_name = f'encoder.layer.{block_idx}.attention.attention'
                 else:
                     raise TypeError(f"{facet} is not a supported facet.")
 
@@ -311,7 +382,7 @@ class ViTExtractor:
         :param bin: apply log binning to the descriptor. default is False.
         :return: tensor of descriptors. Bx1xtxd' where d' is the dimension of the descriptors.
         """
-        assert facet in ['key', 'query', 'value', 'token'], f"""{facet} is not a supported facet for descriptors. 
+        assert facet in ['key', 'query', 'value', 'token', 'qkv'], f"""{facet} is not a supported facet for descriptors. 
                                                              choose from ['key' | 'query' | 'value' | 'token'] """
         self._extract_features(batch, [layer], facet)
         x = self._feats[0]
@@ -325,6 +396,7 @@ class ViTExtractor:
             assert not bin, "bin = True and include_cls = True are not supported together, set one of them False."
         if not bin:
             desc = x.permute(0, 2, 3, 1).flatten(start_dim=-2, end_dim=-1).unsqueeze(dim=1)  # Bx1xtx(dxh)
+            # desc = x
         else:
             desc = self._log_bin(x)
         return desc

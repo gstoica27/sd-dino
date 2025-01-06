@@ -1,3 +1,4 @@
+import pdb
 import argparse
 import torch
 import torchvision.transforms
@@ -38,7 +39,7 @@ class ViTExtractor:
             self.model = model
         else:
             self.model = ViTExtractor.create_model(model_type)
-
+        # pdb.set_trace()
         self.model = ViTExtractor.patch_vit_resolution(self.model, stride=stride)
         self.model.eval()
         self.model.to(self.device)
@@ -134,8 +135,9 @@ class ViTExtractor:
             patch_size = patch_size[0]
         if stride == patch_size:  # nothing to do
             return model
-
         stride = nn_utils._pair(stride)
+        # pdb.set_trace()
+        print("Stride: {} | Patch Size: {}".format(stride, patch_size))
         assert all([(patch_size // s_) * s_ == patch_size for s_ in
                     stride]), f'stride {stride} should divide patch_size {patch_size}'
 
