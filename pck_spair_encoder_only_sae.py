@@ -25,6 +25,115 @@ from extractor_hf_openclip import ViTExtractor as OpenClipExtractorHF
 from extractor_sd import load_model, process_features_and_mask, get_mask
 from copy import deepcopy
 
+# from sae_editing.train_no_aligner import LightningSAETrainWrapper
+from sae_editing.model import HetSAE
+
+def edit_features_with_sae_og(crosscoder, source_features, target_features):
+    # Assume that features are stored in the *same* order in the source and target
+    crosscoder.eval()
+    with torch.no_grad():
+        # pdb.set_trace()
+        # ____________________________________ #
+        # source_key = 'openclip&transformer_resblocks_9_attn_key' 
+        # target_key = 'dinov1&encoder_layer_9_attention_attention_key'
+        # pdb.set_trace()
+        # [B,1,T,D] -> 
+        source_features_reshaped = {
+            k: reshape_features(v, k).cuda() for k,v in source_features.items()
+        }
+        target_features_reshaped = {
+            k: reshape_features(v, k).cuda() for k,v in target_features.items()
+        }
+        # source_features[source_key] = reshape_features(source_features[source_key].cpu(), 
+        # [B,T,H,E] -> [B,H,T,E] -> [BxHxT,E]
+        # target_features[target_key] = target_features[target_key].cpu().reshape(1, 2809, 12, 192).permute(0, 2, 1, 3).flatten(0, 2)
+        # pdb.set_trace()
+        # ____________________________________ #
+        source_encoded = crosscoder.encode(source_features_reshaped, apply_activation=False)
+        source_latents = {k: F.relu(v[0]) for k,v in source_encoded.items()}
+        target_encoded = crosscoder.encode(target_features_reshaped, apply_activation=False)
+        target_latents = {k: F.relu(v[0]) for k,v in target_encoded.items()}
+        # # pdb.set_trace()
+        # aligned_source = torch.cat([x[0] for x in aligned_source.values()], dim=0)
+        # aligned_target = torch.cat([x[0] for x in aligned_target.values()], dim=0)
+        # pdb.set_trace()
+        # source_latents, source_stats = autoencoder.encode(aligned_source)
+        # target_latents, _ = autoencoder.encode(aligned_target)
+        # pdb.set_trace()
+        fused_latents = {
+            source_k: (
+                F.relu(target_latents[target_k] - source_latents[source_k]) + source_latents[source_k],
+                source_encoded[source_k][1]
+            ) for source_k, target_k in zip(source_latents.keys(), target_latents.keys())
+        }
+        # fused_latents = F.relu(target_latents - source_latents) + source_latents
+        # fused_aligned = autoencoder.decode(fused_latents, source_stats)
+        # source_key = list(source_features.keys())[0]
+        # fused_features = aligner.decode({source_key: fused_aligned})[source_key]
+        # pdb.set_trace()
+        fused_features = crosscoder.decode(fused_latents)
+        fused_features = {
+            k: v.reshape(*source_features[k].shape) for k,v in fused_features.items()
+        } # Bx1xtx(dxh)
+        # pdb.set_trace()
+    return get_first_dict_value(fused_features)
+
+
+def reshape_features(features, key):
+    B, _, T, C = features.shape
+    try:
+        assert _ == 1
+    except:
+        pdb.set_trace()
+    
+    if any([tag in key for tag in ['key', 'query', 'value']]):
+        features = features.reshape(B, T, 12, C // 12)
+    # .permute(0, 2, 1, 3).flatten(start_dim=-2, end_dim=-1)
+    return features.flatten(0, 2)
+
+
+def get_first_dict_value(d):
+    return d[list(d.keys())[0]]
+
+
+def edit_features_with_sae(crosscoder, source_features, target_features):
+    # Assume that features are stored in the *same* order in the source and target
+    crosscoder.eval()
+    with torch.no_grad():
+        
+        source_features_reshaped = {k: reshape_features(v, k).cuda() for k,v in source_features.items()}
+        source_encoded = crosscoder.encode(source_features_reshaped, apply_activation=False)
+        source_latents = {k: F.relu(v[0]) for k,v in source_encoded.items()}
+        
+        target_features_reshaped = {k: reshape_features(v, k).cuda() for k,v in target_features.items()}
+        target_encoded = crosscoder.encode(target_features_reshaped, apply_activation=False)
+        target_latents = {k: F.relu(v[0]) for k,v in target_encoded.items()}
+        
+        fused_latents = {
+            source_k: (
+                F.relu(target_latents[target_k] - source_latents[source_k]) + source_latents[source_k],
+                source_encoded[source_k][1]
+            ) for source_k, target_k in zip(source_latents.keys(), target_latents.keys())
+        }
+        fused_features = crosscoder.decode(fused_latents)
+        fused_features = {
+            k: v.reshape(*source_features[k].shape) for k,v in fused_features.items()
+        } # Bx1xtx(dxh)
+    return get_first_dict_value(fused_features)
+
+
+def sum_features(source_features, target_features):
+    # Assume that features are stored in the *same* order in the source and target
+    with torch.no_grad():
+        source_features = {k: v.cuda() for k,v in source_features.items()}
+        target_features = {k: v.cuda() for k,v in target_features.items()}
+        fused_features = {
+            source_k: (
+                (source_features[source_k] + target_features[target_k]) / 2
+            ) for source_k, target_k in zip(source_features.keys(), target_features.keys())
+        }
+    return get_first_dict_value(fused_features)
+
 
 def preprocess_kps_pad(kps, img_width, img_height, size):
     # Once an image has been pre-processed via border (or zero) padding,
@@ -74,10 +183,9 @@ def load_spair_data(path, size=256, category='cat', split='test', subsample=None
         target_fn = f'{path}/JPEGImages/{category}/{data["trg_imname"]}'
         source_bbox = np.asarray(data["src_bndbox"])
         target_bbox = np.asarray(data["trg_bndbox"])
-        # The source thresholds aren't actually used to evaluate PCK on SPair-71K, but for completeness
-        # they are computed as well:
-        # thresholds.append(max(source_bbox[3] - source_bbox[1], source_bbox[2] - source_bbox[0]))
-        # thresholds.append(max(target_bbox[3] - target_bbox[1], target_bbox[2] - target_bbox[0]))
+        
+        thresholds.append(max(source_bbox[3] - source_bbox[1], source_bbox[2] - source_bbox[0]))
+        thresholds.append(max(target_bbox[3] - target_bbox[1], target_bbox[2] - target_bbox[0]))
 
         source_size = data["src_imsize"][:2]  # (W, H)
         target_size = data["trg_imsize"][:2]  # (W, H)
@@ -163,57 +271,64 @@ def load_pascal_data(path, size=256, category='cat', split='test', subsample=Non
     return files, kps, None
 
 def compute_pck(
+    sae_type,
     model, aug, save_path, files, kps, category, 
     mask=False, dist='cos', thresholds=None, 
-    real_size=960, layer=9, facet='key',
-    output_transform=None
+    real_size=960, layer=9, facet='key'
 ):
-    
+    import sys
+    sys.path.append('/gscratch/krishna/gstoica3/research/sd-dino/sae_editing')
+    # pdb.set_trace()
+    # sae_dir = '/mmfs1/gscratch/krishna/gstoica3/research/sae_editing/notebooks/checkpoints'
+    sae_dir = '/mmfs1/gscratch/krishna/gstoica3/research/sae_editing/notebooks/explorations/full_sae/checkpoints/vanilla_sae'
+
+    # aligner = torch.load(os.path.join(sae_dir, 'aligner_epoch=9-step=80810_torch_model.pth'))
+    # autoencoder = torch.load(os.path.join(sae_dir, 'autoencoder_epoch=9-step=80810_torch_model.pth'))
+    # crosscoder = torch.load(os.path.join(sae_dir, 'sae_epoch=4-val_total_loss=0.8.ckpt')).cuda()
+    # crosscoder = torch.load(os.path.join(sae_dir, 'epoch=19-val_loss=0.76.ckpt')).cuda()
+    # crosscoder = torch.load(os.path.join(sae_dir, 'epoch=29-val_loss=0.62.ckpt')).cuda()
+    crosscoder = torch.load(os.path.join(sae_dir, 'epoch=168-val_loss=0.64_orig_mod.ckpt')).cuda()
+    # pdb.set_trace()
     img_size = 224
     model_dict={
-        'small':'dinov2_vits14',
-        'base':'dinov2_vitb14',
-        'large':'dinov2_vitl14',
-        'giant':'dinov2_vitg14',
         'hf_dinov1_vitb16': 'facebook/dino-vitb16',
         'openclip_vitb16': ( 'ViT-B-16', 'laion400m_e31')
     }
-    
-    model_type = model_dict[MODEL_SIZE]# if DINOV2 else 'dino_vits8'
-    # TODO: DELETE
-    # layer = 11 if DINOV2 else 9
-    # facet = 'token' if DINOV2 else 'key'
-    if 'l' in model_type:
-        layer = 23
-    elif 'g' in model_type:
-        layer = 39
-    # stride = 4
-    stride = 14 if DINOV2 else 4 if ONLY_DINO else 8
+    # model_types = [model_dict[model_name] for model_name in MODEL_NAMES]
+    # TODO: DELETE THESE
+    model_types = [
+        ( 'ViT-B-16', 'laion400m_e31'),
+        'facebook/dino-vitb16',
+    ]
+    MODEL_NAMES = [
+        'openclip_vitb16',
+        'hf_dinov1_vitb16',
+    ]
+    stride = 4
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # indiactor = 'v2' if DINOV2 else 'v1'
     # model_size = model_type.split('vit')[-1]
-    if output_transform is not None:
-        output_transform['layer'] = layer
-        output_transform['facet'] = facet
-    if 'hf_dinov1_vitb16' == MODEL_SIZE:
-        logger.info("Using HF DINOv1 model")
-        extractor = ViTExtractorHF(
-            model_type, stride, device=device, model_load_path=MODEL_LOAD_PATH, 
-            output_transform=output_transform, model_load_type=MODEL_LOAD_TYPE
-        )
-        # pdb.set_trace()
-        patch_size = extractor.model.embeddings.patch_embeddings.patch_size[0]
-    elif 'openclip_vitb16' == MODEL_SIZE:
-        logger.info("Using OpenClip model")
-        extractor = OpenClipExtractorHF(model_type, stride, device=device, model_load_path=MODEL_LOAD_PATH)
-        patch_size = extractor.model.patch_size[0]
-    else:
-        extractor = ViTExtractor(model_type, stride, device=device)
-        # patch_size = extractor.model.embeddings.patch_size
-        patch_size = extractor.model.patch_embed.patch_size[0] if DINOV2 else extractor.model.patch_embed.patch_size
-    num_patches = int(patch_size / stride * (img_size // patch_size - 1) + 1)
-    
-    input_text = "a photo of "+category if TEXT_INPUT else None
+    name2processing = {}
+    for model_name, model_type in zip(MODEL_NAMES, model_types):
+        if 'hf_dinov1_vitb16' == model_name:
+            model_name = 'dinov1'
+            logger.info("Using HF DINOv1 model")
+            extractor = ViTExtractorHF(model_type, stride, device=device)
+            patch_size = extractor.model.embeddings.patch_embeddings.patch_size[0]
+        elif 'openclip_vitb16' == model_name:
+            model_name = 'openclip'
+            logger.info("Using OpenClip model")
+            extractor = OpenClipExtractorHF(model_type, stride, device=device)
+            patch_size = extractor.model.patch_size[0]
+        else:
+            extractor = ViTExtractor(model_type, stride, device=device)
+            patch_size = extractor.model.embeddings.patch_size
+        num_patches = int(patch_size / stride * (img_size // patch_size - 1) + 1)
+        name2processing[model_name] = {
+            'extractor': extractor,
+            'patch_size': patch_size,
+            'num_patches': num_patches
+        }
 
     current_save_results = 0
     gt_correspondences = []
@@ -251,94 +366,78 @@ def compute_pck(
         img2_patch_idx = num_patches * img2_y_patch + img2_x_patch
 
         # pdb.set_trace()
-        with torch.no_grad():
-            # if not CO_PCA:
-            #     # if FUSE_DINO:
-            #     img1_batch = extractor.preprocess_pil(img1)
-            #     img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
-            #     img2_batch = extractor.preprocess_pil(img2)
-            #     img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
+        dist = dist.lower()
+        def extract_features(extractor, layer, facet, dist, name):
+            with torch.no_grad():
+                if not CO_PCA:
+                    # if FUSE_DINO:
+                    img1_batch = extractor.preprocess_pil(img1)
+                    img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
+                    img2_batch = extractor.preprocess_pil(img2)
+                    img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
 
-            # else:
-            # if FUSE_DINO:
-            img1_batch = extractor.preprocess_pil(img1)
-            img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
-            img2_batch = extractor.preprocess_pil(img2)
-            img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
-            
-            if CO_PCA_DINO:
-                cat_desc_dino = torch.cat((img1_desc_dino, img2_desc_dino), dim=2).squeeze() # (1, 1, num_patches**2, dim)
-                mean = torch.mean(cat_desc_dino, dim=0, keepdim=True)
-                centered_features = cat_desc_dino - mean
-                U, S, V = torch.pca_lowrank(centered_features, q=CO_PCA_DINO)
-                reduced_features = torch.matmul(centered_features, V[:, :CO_PCA_DINO]) # (t_x+t_y)x(d)
-                processed_co_features = reduced_features.unsqueeze(0).unsqueeze(0)
-                img1_desc_dino = processed_co_features[:, :, :img1_desc_dino.shape[2], :]
-                img2_desc_dino = processed_co_features[:, :, img1_desc_dino.shape[2]:, :]
-
-            if 'l1' in dist or 'l2' in dist or dist == 'plus_norm':
-                # normalize the features
-                img1_desc = img1_desc / img1_desc.norm(dim=-1, keepdim=True)
-                img2_desc = img2_desc / img2_desc.norm(dim=-1, keepdim=True)
-                img1_desc_dino = img1_desc_dino / img1_desc_dino.norm(dim=-1, keepdim=True)
-                img2_desc_dino = img2_desc_dino / img2_desc_dino.norm(dim=-1, keepdim=True)
-
-            if dist=='plus' or dist=='plus_norm':
-                img1_desc = img1_desc + img1_desc_dino
-                img2_desc = img2_desc + img2_desc_dino
-                dist='cos'
-            
-            img1_desc = img1_desc_dino
-            img2_desc = img2_desc_dino
-        # logger.info(img1_desc.shape, img2_desc.shape)
-            # pdb.set_trace()
-
-            if DRAW_DENSE:
-                mask1 = get_mask(model, aug, img1, category)
-                mask2 = get_mask(model, aug, img2, category)
-
-                if ONLY_DINO:# or not FUSE_DINO:
-                    img1_desc = img1_desc / img1_desc.norm(dim=-1, keepdim=True)
-                    img2_desc = img2_desc / img2_desc.norm(dim=-1, keepdim=True)
+                else: # THIS IS HIT
+                    # if FUSE_DINO:
+                    img1_batch = extractor.preprocess_pil(img1)
+                    img1_desc_dino = extractor.extract_descriptors(img1_batch.to(device), layer, facet)
+                    img2_batch = extractor.preprocess_pil(img2)
+                    img2_desc_dino = extractor.extract_descriptors(img2_batch.to(device), layer, facet)
                 
-                img1_desc_reshaped = img1_desc.permute(0,1,3,2).reshape(-1, img1_desc.shape[-1], num_patches, num_patches)
-                img2_desc_reshaped = img2_desc.permute(0,1,3,2).reshape(-1, img2_desc.shape[-1], num_patches, num_patches)
-                trg_dense_output, src_color_map = find_nearest_patchs(mask2, mask1, img2, img1, img2_desc_reshaped, img1_desc_reshaped, mask=mask, resolution=128)
-                if current_save_results!=TOTAL_SAVE_RESULT:
-                    if not os.path.exists(f'{save_path}/{category}'):
-                        os.makedirs(f'{save_path}/{category}')
-                    fig_colormap, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
-                    ax1.axis('off')
-                    ax2.axis('off')
-                    ax1.imshow(src_color_map)
-                    ax2.imshow(trg_dense_output)
-                    fig_colormap.savefig(f'{save_path}/{category}/{pair_idx}_colormap.png')
-                    plt.close(fig_colormap)
-            
-            if DRAW_SWAP:
-                if not DRAW_DENSE:
-                    mask1 = get_mask(model, aug, img1, category)
-                    mask2 = get_mask(model, aug, img2, category)
+                if CO_PCA_DINO: # THIS IS IGNORED
+                    cat_desc_dino = torch.cat((img1_desc_dino, img2_desc_dino), dim=2).squeeze() # (1, 1, num_patches**2, dim)
+                    mean = torch.mean(cat_desc_dino, dim=0, keepdim=True)
+                    centered_features = cat_desc_dino - mean
+                    U, S, V = torch.pca_lowrank(centered_features, q=CO_PCA_DINO)
+                    reduced_features = torch.matmul(centered_features, V[:, :CO_PCA_DINO]) # (t_x+t_y)x(d)
+                    processed_co_features = reduced_features.unsqueeze(0).unsqueeze(0)
+                    img1_desc_dino = processed_co_features[:, :, :img1_desc_dino.shape[2], :]
+                    img2_desc_dino = processed_co_features[:, :, img1_desc_dino.shape[2]:, :]
 
-                if ONLY_DINO:# or not FUSE_DINO:
+                if 'l1' in dist or 'l2' in dist or dist == 'plus_norm': # THIS IS IGNORED
+                    # normalize the features
                     img1_desc = img1_desc / img1_desc.norm(dim=-1, keepdim=True)
                     img2_desc = img2_desc / img2_desc.norm(dim=-1, keepdim=True)
-                    
-                img1_desc_reshaped = img1_desc.permute(0,1,3,2).reshape(-1, img1_desc.shape[-1], num_patches, num_patches)
-                img2_desc_reshaped = img2_desc.permute(0,1,3,2).reshape(-1, img2_desc.shape[-1], num_patches, num_patches)
-                trg_dense_output, src_color_map = find_nearest_patchs_replace(mask2, mask1, img2, img1, img2_desc_reshaped, img1_desc_reshaped, mask=mask, resolution=156, draw_gif=DRAW_GIF, save_path=f'{save_path}/{category}/{pair_idx}_swap.gif')
-                if current_save_results!=TOTAL_SAVE_RESULT:
-                    if not os.path.exists(f'{save_path}/{category}'):
-                        os.makedirs(f'{save_path}/{category}')
-                    fig_colormap, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
-                    ax1.axis('off')
-                    ax2.axis('off')
-                    ax1.imshow(src_color_map)
-                    ax2.imshow(trg_dense_output)
-                    fig_colormap.savefig(f'{save_path}/{category}/{pair_idx}_swap.png')
-                    plt.close(fig_colormap)
+                    img1_desc_dino = img1_desc_dino / img1_desc_dino.norm(dim=-1, keepdim=True)
+                    img2_desc_dino = img2_desc_dino / img2_desc_dino.norm(dim=-1, keepdim=True)
 
-        if MASK and CO_PCA:
+                if dist=='plus' or dist=='plus_norm': # THIS IS IGNORED
+                    img1_desc = img1_desc + img1_desc_dino
+                    img2_desc = img2_desc + img2_desc_dino
+                    dist='cos'
+                
+                img1_desc = img1_desc_dino
+                img2_desc = img2_desc_dino
+            module_name = extractor.hook_module_name.replace('.', '_')
+            return {
+                'img1_desc': {f'{name}&{module_name}': img1_desc.cpu()}, 
+                'img2_desc': {f'{name}&{module_name}': img2_desc.cpu()}
+            }
+        
+        img1_descs = []
+        img2_descs = []
+        for name, processing in name2processing.items():
+            descs = extract_features(processing['extractor'], layer, facet, dist, name)
+            img1_descs.append(descs['img1_desc'])
+            img2_descs.append(descs['img2_desc'])
+        
+        # pdb.set_trace()
+        if sae_type == 'dino_to_clip':
+            # print("dino_to_clip")
+            img1_desc = edit_features_with_sae(crosscoder, img1_descs[0], img1_descs[1]).cuda()
+            img2_desc = edit_features_with_sae(crosscoder, img2_descs[0], img2_descs[1]).cuda()
+        elif sae_type == 'clip_to_dino':
+            # print("clip_to_dino")
+            img1_desc = edit_features_with_sae(crosscoder, img1_descs[1], img1_descs[0]).cuda()
+            img2_desc = edit_features_with_sae(crosscoder, img2_descs[1], img2_descs[0]).cuda()
+        elif sae_type == 'ensemble_sum':
+            # print("ensemble_sum")
+            img1_desc = sum_features(img1_descs[0], img1_descs[1]).cuda()
+            img2_desc = sum_features(img2_descs[0], img2_descs[1]).cuda()
+        else:
+            raise ValueError("Uknown SAE type")
+        # pdb.set_trace()
+        # logger.info(img1_desc.shape, img2_desc.shape)
+        if MASK and CO_PCA: # THIS IS IGNORED
             mask2 = get_mask(model, aug, img2, category)
             img2_desc = img2_desc.permute(0,1,3,2).reshape(-1, img2_desc.shape[-1], num_patches, num_patches)
             resized_mask2 = F.interpolate(mask2.cuda().unsqueeze(0).unsqueeze(0).float(), size=(num_patches, num_patches), mode='nearest')
@@ -352,11 +451,9 @@ def compute_pck(
         if COUNT_INVIS:
             vis = torch.ones_like(vis)
         # Get similarity matrix
+        # pdb.set_trace()
         if dist == 'cos':
-            try:
-                sim_1_to_2 = chunk_cosine_sim(img1_desc, img2_desc).squeeze()
-            except:
-                pdb.set_trace()
+            sim_1_to_2 = chunk_cosine_sim(img1_desc, img2_desc).squeeze()
         elif dist == 'l2':
             sim_1_to_2 = pairwise_sim(img1_desc, img2_desc, p=2).squeeze()
         elif dist == 'l1':
@@ -424,13 +521,7 @@ def compute_pck(
     return correct
 
 def main(args):
-    global \
-        MASK, SAMPLE, DIST, COUNT_INVIS, TOTAL_SAVE_RESULT, \
-        BBOX_THRE, VER, CO_PCA, PCA_DIMS, SIZE, FUSE_DINO, \
-        DINOV2, MODEL_SIZE, DRAW_DENSE, TEXT_INPUT, DRAW_SWAP, \
-        ONLY_DINO, SEED, EDGE_PAD, WEIGHT, CO_PCA_DINO, PASCAL, \
-        DRAW_GIF, RAW, MODEL_LOAD_PATH, OUTPUT_TRANSFORM, \
-        MODEL_LOAD_TYPE
+    global SAE_TYPE, MASK, SAMPLE, DIST, COUNT_INVIS, TOTAL_SAVE_RESULT, BBOX_THRE, VER, CO_PCA, PCA_DIMS, SIZE, FUSE_DINO, DINOV2, MODEL_NAMES, TEXT_INPUT, ONLY_DINO, SEED, EDGE_PAD, WEIGHT, CO_PCA_DINO, PASCAL, RAW
     MASK = args.MASK
     SAMPLE = args.SAMPLE
     DIST = args.DIST
@@ -448,44 +539,24 @@ def main(args):
     FUSE_DINO = True
     ONLY_DINO = args.ONLY_DINO
     DINOV2 = False if args.DINOV1 else True
-    MODEL_SIZE = args.MODEL_SIZE
-    MODEL_LOAD_PATH = args.MODEL_LOAD_PATH
-    MODEL_LOAD_TYPE = args.MODEL_LOAD_TYPE
-    
-    DRAW_DENSE = args.DRAW_DENSE
-    DRAW_SWAP = args.DRAW_SWAP
-    DRAW_GIF = args.DRAW_GIF
+    MODEL_NAMES = args.MODEL_NAMES
     TEXT_INPUT = args.TEXT_INPUT
     
     SEED = args.SEED
     WEIGHT = args.WEIGHT # corresponde to three groups for the sd features, and one group for the dino features
     PASCAL = args.PASCAL
     RAW = args.RAW
-    # Output transforms
-    OUTPUT_TRANSFORM = None
-    if args.output_transform_type is not None:
-        OUTPUT_TRANSFORM = {'type': args.output_transform_type}
-    if args.output_transform_scale is not None and OUTPUT_TRANSFORM is not None:
-        OUTPUT_TRANSFORM['scale'] = args.output_transform_scale
-    if args.transform_load_path is not None and OUTPUT_TRANSFORM is not None:
-        OUTPUT_TRANSFORM['load_path'] = args.transform_load_path
-    print("Output Transform: ", OUTPUT_TRANSFORM)
-    LAYERS = [2, 5, 8, 9, 10, 11]
+    SAE_TYPE = args.SAE_TYPE
+    
+    SAE_CHECKPOINT_PATH = args.SAE_CHECKPOINT_PATH
+    
+    LAYERS = [9]
     # LAYERS = [9, 10, 11]
-    # LAYERS = [9]
-    FACETS = ['key', 'query', 'value', 'token'][::-1]
-    # FACETS = ['key', 'query', 'value'][::-1]
-    # FACETS = ['key']
-    # FACETS = ['key']
-    # TODO: If DiNOv2!. Else comment out
-    # LAYERS = [11]
-    # FACETS = ['token']
+    # FACETS = ['key', 'query', 'value', 'token'][::-1]
+    FACETS = ['key']
     
     if SAMPLE == 0:
         SAMPLE = None
-    if DRAW_DENSE or DRAW_SWAP:
-        TOTAL_SAVE_RESULT = SAMPLE
-        MASK = True
     if ONLY_DINO:
         FUSE_DINO = True
     if FUSE_DINO and not ONLY_DINO:
@@ -506,9 +577,9 @@ def main(args):
         num_timesteps=args.TIMESTEP, 
         block_indices=tuple(INDICES)
     )
-    save_path=f'./results_spair/pck_fuse_{args.NOTE}mask_{MASK}_sample_{SAMPLE}_BBOX_{BBOX_THRE}_dist_{DIST}_Invis_{COUNT_INVIS}_{args.TIMESTEP}{VER}_{MODEL_SIZE}_{SIZE}_copca_{CO_PCA}_{INDICES[0]}_{PCA_DIMS[0]}_{INDICES[1]}_{PCA_DIMS[1]}_{INDICES[2]}_{PCA_DIMS[2]}_text_{TEXT_INPUT}_sd_{WEIGHT[3]}{not ONLY_DINO}_dino_{WEIGHT[4]}{FUSE_DINO}'
+    save_path=f'./results_spair/pck_fuse_{args.NOTE}mask_{MASK}_sample_{SAMPLE}_BBOX_{BBOX_THRE}_dist_{DIST}_Invis_{COUNT_INVIS}_{args.TIMESTEP}{VER}_{MODEL_NAMES}_{SIZE}_copca_{CO_PCA}_{INDICES[0]}_{PCA_DIMS[0]}_{INDICES[1]}_{PCA_DIMS[1]}_{INDICES[2]}_{PCA_DIMS[2]}_text_{TEXT_INPUT}_sd_{WEIGHT[3]}{not ONLY_DINO}_dino_{WEIGHT[4]}{FUSE_DINO}'
     if PASCAL:
-        save_path=f'./results_pascal/pck_fuse_{args.NOTE}mask_{MASK}_sample_{SAMPLE}_BBOX_{BBOX_THRE}_dist_{DIST}_Invis_{COUNT_INVIS}_{args.TIMESTEP}{VER}_{MODEL_SIZE}_{SIZE}_copca_{CO_PCA}_{INDICES[0]}_{PCA_DIMS[0]}_{INDICES[1]}_{PCA_DIMS[1]}_{INDICES[2]}_{PCA_DIMS[2]}_text_{TEXT_INPUT}_sd_{WEIGHT[3]}{not ONLY_DINO}_dino_{WEIGHT[4]}{FUSE_DINO}'
+        save_path=f'./results_pascal/pck_fuse_{args.NOTE}mask_{MASK}_sample_{SAMPLE}_BBOX_{BBOX_THRE}_dist_{DIST}_Invis_{COUNT_INVIS}_{args.TIMESTEP}{VER}_{MODEL_NAMES}_{SIZE}_copca_{CO_PCA}_{INDICES[0]}_{PCA_DIMS[0]}_{INDICES[1]}_{PCA_DIMS[1]}_{INDICES[2]}_{PCA_DIMS[2]}_text_{TEXT_INPUT}_sd_{WEIGHT[3]}{not ONLY_DINO}_dino_{WEIGHT[4]}{FUSE_DINO}'
     if EDGE_PAD:
         save_path += '_edge_pad'
     if not os.path.exists(save_path):
@@ -526,8 +597,8 @@ def main(args):
                     'bus', 'car', 'cat', 'chair', 'cow',
                     'diningtable', 'dog', 'horse', 'motorbike', 'person',
                     'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'] # for pascal
-    img_size = 840 if DINOV2 else 224 if ONLY_DINO else 480
-    # img_size = 224
+    # img_size = 840 if DINOV2 else 224 if ONLY_DINO else 480
+    img_size = 224
     best_pcks = None
     start_time=time.time()
     for layer in LAYERS:
@@ -553,17 +624,17 @@ def main(args):
                     
                 if BBOX_THRE:
                     pck = compute_pck(
+                        SAE_TYPE,
                         model, aug, save_path, files, kps, cat, mask=MASK, 
                         dist=DIST, thresholds=thresholds, real_size=SIZE,
-                        layer=layer, facet=facet, 
-                        output_transform=OUTPUT_TRANSFORM
+                        layer=layer, facet=facet
                     )
                 else:
                     pck = compute_pck(
+                        SAE_TYPE,
                         model, aug, save_path, files, kps, cat,
                         mask=MASK, dist=DIST, real_size=SIZE,
-                        layer=layer, facet=facet, 
-                        output_transform=OUTPUT_TRANSFORM
+                        layer=layer, facet=facet
                     )
                 pcks.append(pck[0])
                 pcks_05.append(pck[1])
@@ -612,7 +683,6 @@ def main(args):
     logger.info(f"Weighted PCK0.10: {np.average(pcks, weights=weights) * 100:.2f}")
     logger.info(f"Weighted PCK0.05: {np.average(pcks_05, weights=weights) * 100:.2f}")
     logger.info(f"Weighted PCK0.01: {np.average(pcks_01, weights=weights) * 100:.2f}") if not PASCAL else logger.info(f"Weighted PCK0.15: {np.average(pcks_01, weights=weights) * 100:.2f}")
-    return best_pcks
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -637,22 +707,12 @@ if __name__ == '__main__':
     parser.add_argument('--NOT_FUSE', action='store_true', default=False)           # set true to use only sd features
     parser.add_argument('--ONLY_DINO', action='store_true', default=False)          # set true to use only dino features
     parser.add_argument('--DINOV1',  action='store_true', default=False)            # set true to use dinov1
-    parser.add_argument('--MODEL_SIZE', type=str, default='base')                   # model size of thye dinov2, small, base, large
-    parser.add_argument('--MODEL_LOAD_PATH', nargs='?', default=None)                   # model size of thye dinov2, small, base, large
-    parser.add_argument('--MODEL_LOAD_TYPE', type=str, default=None)
-
-    parser.add_argument('--DRAW_DENSE', action='store_true', default=False)         # set true to draw the dense correspondences
-    parser.add_argument('--DRAW_SWAP', action='store_true', default=False)          # set true to draw the swapped images
-    parser.add_argument('--DRAW_GIF', action='store_true', default=False)           # set true to generate the gif for the swapped images
+    parser.add_argument('--MODEL_NAMES', type=str, default='base')                   # model size of thye dinov2, small, base, large
     parser.add_argument('--TEXT_INPUT', action='store_true', default=False)         # set true to use the explicit text input
 
     parser.add_argument('--PASCAL', action='store_true', default=False)             # set true to test on pfpascal dataset
     parser.add_argument('--NOTE', type=str, default='')
-    parser.add_argument('--output_transform_type', type=str, default=None)
-    parser.add_argument('--output_transform_scale', type=float, default=None)
-    # parser.add_arguent('--output_transform_bias', action='store_true', default=False)
-    parser.add_argument('--transform_load_path', type=str, default=None)
-    
-
+    parser.add_argument('--SAE_CHECKPOINT_PATH', type=str, default='/mmfs1/gscratch/krishna/gstoica3/research/sae_editing/notebooks/checkpoints/epoch=9-step=80810_torch.pth')
+    parser.add_argument('--SAE_TYPE', type=str, default='dino_to_clip')
     args = parser.parse_args()
     main(args)

@@ -14,7 +14,7 @@ import os
 from transformers import ViTModel, ViTImageProcessor
 import pdb
 from feature_transforms import *
-from utils.custom_models import load_clip_into_dino
+from utils.custom_models import load_clip_into_dino, convert_clip_to_dino
 from typing import Optional
 
 
@@ -108,7 +108,8 @@ class ViTExtractor:
         model = ViTModel.from_pretrained(model_type)
         # pdb.set_trace()
         if load_path is not None and load_type == 'clip':
-            model = load_clip_into_dino(model, load_path)
+            # model = load_clip_into_dino(model, load_path)
+            model = convert_clip_to_dino(model, load_path)
         return model
 
     @staticmethod
