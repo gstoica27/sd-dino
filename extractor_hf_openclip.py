@@ -49,7 +49,7 @@ class Attention(nn.Module):
         self.batch_first = module.batch_first
         self.num_heads = module.num_heads
         
-        # self.debugging_module = module
+        self.debugging_module = module
 
     def transpose_tokens(self, x):
         x = x.transpose(0, 1)
@@ -62,8 +62,8 @@ class Attention(nn.Module):
         if k_x is None:
             k_x = deepcopy(q_x)
             v_x = deepcopy(q_x)
-        pdb.set_trace()
-        if self.batch_first:
+            
+        if not self.batch_first:
             for elem in [q_x, k_x, v_x]:
                 self.transpose_tokens(elem)
         
@@ -71,13 +71,10 @@ class Attention(nn.Module):
         k = self.key(k_x)
         v = self.value(v_x)
         
-        # if self.batch_first:
         q = q.transpose(0, 1) # [T,B,C]
         k = k.transpose(0, 1)
         v = v.transpose(0, 1)
-        pdb.set_trace()
         T, B, C = q.shape
-        # print("Q SHAPE: ", q.shape)
         q = q.reshape(T, B * self.num_heads, -1).transpose(0, 1)
         k = k.reshape(T, B * self.num_heads, -1).transpose(0, 1)
         v = v.reshape(T, B * self.num_heads, -1).transpose(0, 1) # [BxnH,T,C/nH]
@@ -88,12 +85,6 @@ class Attention(nn.Module):
             new_attn_mask.masked_fill_(attn_mask, float("-inf"))
             attn_mask = new_attn_mask
 
-        # x = F.scaled_dot_product_attention(
-        #     q, k, v,
-        #     attn_mask=attn_mask,
-        #     dropout_p=self.out_drop.p if self.training else 0.,
-        # )
-        # q = q * self.scale
         attn = torch.bmm(q, k.transpose(-1, -2)) / math.sqrt(q.shape[-1])
         if attn_mask is not None:
             attn += attn_mask
@@ -102,17 +93,17 @@ class Attention(nn.Module):
         # attn = self.attn_drop(attn)
         x = torch.bmm(attn, v)
         x = x.transpose(1, 0).reshape(T, B, self.num_heads, -1).flatten(2)
-        # x = x.reshape(T, B, C)
+        # x = x.reshape(T, B, 
 
-        if self.batch_first:
+        if not self.batch_first:
             x = x.transpose(0, 1)
 
         x = self.out_proj(x)
         x = self.out_drop(x)
-        
-        # debugging_x = self.debugging_module(q_x, k_x, v_x, attn_mask=attn_mask, **kwargs)
-        # if not torch.allclose(debugging_x[0], x):
-        #     pdb.set_trace()
+        pdb.set_trace()
+        debugging_x = self.debugging_module(q_x, k_x, v_x, attn_mask=attn_mask, **kwargs)
+        if not torch.allclose(debugging_x[0], x):
+            pdb.set_trace()
         # pdb.set_trace()
         return (x, None)
     
@@ -443,6 +434,7 @@ class ViTExtractor:
         :param layers: layers from which to extract features.
         :param facet: facet to extract. One of the following options: ['key' | 'query' | 'value' | 'token' | 'attn']
         """
+        # pdb.set_trace()
         for block_idx, block in enumerate(self.model.transformer.resblocks):
             if block_idx in layers:
                 if facet == 'token':

@@ -109,3 +109,73 @@ class AttentionBlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None, **kwargs
     ):
         return self.merge_heads(self.attention(q_x, k_x, v_x, attn_mask))
+    
+
+# class Attention(nn.Module):
+#     # copied directly from openclip backend. Because nn.MultiheadAttention is really annoying
+#     def __init__(
+#             self,
+#             module: torch.nn.Module,
+#     ):
+#         super().__init__()
+#         if hasattr(module, 'in_proj_bias'):
+#             self.bias = True
+
+#         out_dim, in_dim = module.in_proj_weight.shape
+#         hidden_dim = out_dim // 3
+#         self.query = nn.Linear(in_dim, hidden_dim, bias=self.bias)
+#         self.key = nn.Linear(in_dim, hidden_dim, bias=self.bias)
+#         self.value = nn.Linear(in_dim, hidden_dim, bias=self.bias)
+        
+#         # replace weights
+#         self.query.weight.data = module.in_proj_weight[:hidden_dim, :]
+#         self.key.weight.data = module.in_proj_weight[hidden_dim:2*hidden_dim, :]
+#         self.value.weight.data = module.in_proj_weight[2*hidden_dim:, :]
+#         if self.bias:
+#             self.query.bias.data = module.in_proj_bias[:hidden_dim]
+#             self.key.bias.data = module.in_proj_bias[hidden_dim:2*hidden_dim]
+#             self.value.bias.data = module.in_proj_bias[2*hidden_dim:]
+            
+#         self.out_proj = module.out_proj
+#         self.out_drop = nn.Dropout(module.dropout)
+#         self.batch_first = module.batch_first
+#         self.num_heads = module.num_heads
+#         self.attention_head_size = hidden_dim // self.num_heads
+#         self.hidden_dim = hidden_dim
+        
+#         # self.debugging_module = module
+
+#     def transpose_tokens(self, x):
+#         x = x.transpose(0, 1)
+    
+#     def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+#         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+#         x = x.view(new_x_shape)
+#         return x.permute(0, 2, 1, 3) # [B, H, T, C]
+    
+#     def forward(
+#         self, q_x, k_x: Optional[torch.Tensor]=None, v_x: Optional[torch.Tensor]=None, 
+#         attn_mask: Optional[torch.Tensor] = None, **kwargs
+#     ):
+#         # x = deepcopy(q_x) # [B,T,C]
+#         if k_x is None:
+#             k_x = deepcopy(q_x)
+#             v_x = deepcopy(q_x)
+#         pdb.set_trace()
+#         key_layer = self.transpose_for_scores(self.key(k_x))
+#         value_layer = self.transpose_for_scores(self.value(v_x))
+#         query_layer = self.transpose_for_scores(self.query(q_x))
+
+#         # Take the dot product between "query" and "key" to get the raw attention scores.
+#         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+
+#         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+#         attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+#         attention_probs = self.dropout(attention_probs)
+#         context_layer = torch.matmul(attention_probs, value_layer)
+#         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+#         new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_dim,)
+#         context_layer = context_layer.view(new_context_layer_shape)
+#         outputs = (context_layer,)
+
+#         return outputs
