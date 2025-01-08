@@ -168,7 +168,7 @@ def convert_clip_to_dino(dino_model, clip_path):
 def load_clip_into_dino(dino_model, clip_path):
     print("Loading CLIP weights into DINO model. From ", clip_path)
     clip_sd = torch.load(clip_path, map_location=dino_model.device)
-    pdb.set_trace()
+    # pdb.set_trace()
     dino_model = ready_dino_as_clip(dino_model)
     out = dino_model.load_state_dict(clip_sd)
     print(out)

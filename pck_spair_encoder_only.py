@@ -20,7 +20,8 @@ from loguru import logger
 import argparse
 from extractor_dino import ViTExtractor
 from extractor_hf_dino import ViTExtractor as ViTExtractorHF
-from extractor_hf_openclip import ViTExtractor as OpenClipExtractorHF
+# from extractor_hf_openclip import ViTExtractor as OpenClipExtractorHF
+from extractor_hf_openclipv2 import ViTExtractor as OpenClipExtractorHF
 
 from extractor_sd import load_model, process_features_and_mask, get_mask
 from copy import deepcopy
@@ -472,7 +473,8 @@ def main(args):
     print("Output Transform: ", OUTPUT_TRANSFORM)
     LAYERS = [2, 5, 8, 9, 10, 11]
     # LAYERS = [9, 10, 11]
-    # LAYERS = [9]
+    # LAYERS = [8]
+    # FACETS = ['value']
     FACETS = ['key', 'query', 'value', 'token'][::-1]
     # FACETS = ['key', 'query', 'value'][::-1]
     # FACETS = ['key']
@@ -526,8 +528,8 @@ def main(args):
                     'bus', 'car', 'cat', 'chair', 'cow',
                     'diningtable', 'dog', 'horse', 'motorbike', 'person',
                     'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'] # for pascal
-    img_size = 840 if DINOV2 else 224 if ONLY_DINO else 480
-    # img_size = 224
+    # img_size = 840 if DINOV2 else 224 if ONLY_DINO else 480
+    img_size = 224
     best_pcks = None
     start_time=time.time()
     for layer in LAYERS:
