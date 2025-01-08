@@ -368,13 +368,13 @@ def compute_pck(
         else:
             raise ValueError('Unknown distance metric')
 
+        pdb.set_trace()
         # Get nearest neighors
         nn_1_to_2 = torch.argmax(sim_1_to_2[img1_patch_idx], dim=1)
         nn_y_patch, nn_x_patch = nn_1_to_2 // num_patches, nn_1_to_2 % num_patches
         nn_x = (nn_x_patch - 1) * stride + stride + patch_size // 2 - .5
         nn_y = (nn_y_patch - 1) * stride + stride + patch_size // 2 - .5
         kps_1_to_2 = torch.stack([nn_x, nn_y]).permute(1, 0)
-
         gt_correspondences.append(img2_kps[vis][:, [1,0]])
         pred_correspondences.append(kps_1_to_2[vis][:, [1,0]])
         if thresholds is not None:
@@ -470,16 +470,16 @@ def main(args):
     if args.transform_load_path is not None and OUTPUT_TRANSFORM is not None:
         OUTPUT_TRANSFORM['load_path'] = args.transform_load_path
     print("Output Transform: ", OUTPUT_TRANSFORM)
-    LAYERS = [2, 5, 8, 9, 10, 11]
+    # LAYERS = [2, 5, 8, 9, 10, 11]
     # LAYERS = [9, 10, 11]
     # LAYERS = [9]
-    FACETS = ['key', 'query', 'value', 'token'][::-1]
+    # FACETS = ['key', 'query', 'value', 'token'][::-1]
     # FACETS = ['key', 'query', 'value'][::-1]
     # FACETS = ['key']
     # FACETS = ['key']
     # TODO: If DiNOv2!. Else comment out
-    # LAYERS = [11]
-    # FACETS = ['token']
+    LAYERS = [11]
+    FACETS = ['token']
     
     if SAMPLE == 0:
         SAMPLE = None
@@ -517,7 +517,8 @@ def main(args):
     logger = get_logger(save_path+'/result.log')
 
     logger.info(args)
-    data_dir = '/gscratch/krishna/gstoica3/datasets/spair71k/SPair-71k/' if not PASCAL else 'data/PF-dataset-PASCAL'
+    # data_dir = '/gscratch/krishna/gstoica3/datasets/spair71k/SPair-71k/' if not PASCAL else 'data/PF-dataset-PASCAL'
+    data_dir = '/weka/prior-default/georges/research/sd-dino/data/SPair-71k/' if not PASCAL else 'data/PF-dataset-PASCAL'
     if not PASCAL:
         categories = os.listdir(os.path.join(data_dir, 'ImageAnnotation'))
         categories = sorted(categories)
